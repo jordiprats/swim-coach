@@ -351,7 +351,7 @@ Focus on these in order:
 **Eventually:**
 - [ ] Underwater footage support
 - [ ] Multiple camera angles
-- [ ] Other strokes (backstroke, breaststroke, butterfly)
+- [ ] Backstroke & breaststroke support
 - [ ] Mobile app
 - [ ] Social features (share with coaches/teammates)
 - [ ] Challenges and leaderboards
@@ -407,8 +407,11 @@ This tool is constantly being reviewed and improved by swimmers and swim coaches
 If you prefer terminal over web interface:
 
 ```bash
-# Basic analysis
+# Basic analysis (freestyle, default)
 python main.py path/to/video.mp4
+
+# Butterfly analysis
+python main.py video.mp4 --stroke butterfly
 
 # Custom output path
 python main.py video.mp4 -o output/analysis.mp4
@@ -418,6 +421,47 @@ python main.py video.mp4 --report-only
 
 # Video only (skip report)
 python main.py video.mp4 --no-report
+```
+
+---
+
+## Butterfly Support 🦋
+
+The analyzer now supports **butterfly stroke** in addition to freestyle.
+
+### What's Different for Butterfly
+
+| Aspect | Butterfly |
+|---|---|
+| **Arm motion** | Both arms together (synchronised) |
+| **Body movement** | Dolphin undulation (vertical wave), not side-to-side roll |
+| **Kick** | Simultaneous dolphin kick (both legs together) |
+| **Breathing** | Forward head lift, not side rotation |
+| **Stroke rate** | 30–55 SPM (slower than freestyle) |
+| **Arm entry** | Wider entry (11 & 1 o'clock) |
+
+### Metrics Analyzed
+- Elbow pull angle (120–160° optimal)
+- Arm entry width (wrist span vs shoulder width)
+- Dolphin undulation amplitude
+- Arm synchronisation (delay between left/right wrist peaks)
+- Breathing lift height
+- Dolphin kick knee angle (120–150° optimal)
+- Stroke rate
+
+### Visual Overlays
+When analyzing butterfly, the annotated video shows:
+- **Cyan arm highlights** — both arms drawn with thick cyan lines to emphasise simultaneous motion
+- **Magenta entry-width line** — horizontal line between the two wrists
+- **Undulation trace** — fading trail of hip position (last 30 frames)
+- **SYNC/ASYNC badge** — label between wrists showing synchronisation status
+- **Both elbow angles** — annotated on left and right elbows
+- Stats panel shows **undulation, arm sync, entry width** instead of body rotation
+
+### Backend API
+```bash
+# Upload for butterfly analysis
+curl -F "video=@swim.mp4" -F "stroke=butterfly" http://localhost:5001/api/upload
 ```
 
 ---

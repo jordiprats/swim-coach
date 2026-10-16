@@ -20,8 +20,11 @@ sys.path.append(ROOT)
 from src.feedback_generator import FeedbackGenerator
 from src.pose_detector import PoseDetector
 from src.stroke_analyzer import StrokeAnalyzer
+from src.butterfly_analyzer import ButterflyAnalyzer
 from src.video_processor import VideoProcessor
 from src.visualizer import Visualizer
+from src.data_exporter import export_datapoints_csv
+from src.pose_smoother import smooth_pose_data
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -161,24 +164,41 @@ _cleanup_old_files()
 # ---------------------------------------------------------------------------
 # Video processing (runs in thread pool worker)
 # ---------------------------------------------------------------------------
-def _process_video(video_id: str, input_path: str, output_path: str, report_path: str):
+def _process_video(video_id: str, input_path: str, output_path: str, report_path: str, stroke_type: str = 'freestyle'):
     """Full analysis pipeline executed in a pool worker thread."""
     try:
         _set_status(video_id, status='processing', progress=10,
                     message='Detecting poses...')
 
         pose_detector = PoseDetector()
-        stroke_analyzer = StrokeAnalyzer()
+        stroke_label = stroke_type.capitalize()
+
+        if stroke_type == 'butterfly':
+            analyzer = ButterflyAnalyzer()
+        else:
+            analyzer = StrokeAnalyzer()
+
         visualizer = Visualizer()
         feedback_generator = FeedbackGenerator()
 
         poses = pose_detector.process_video(input_path)
-        _set_status(video_id, progress=50, message='Analyzing stroke mechanics...')
+        _set_status(video_id, progress=35, message='Smoothing & interpolating pose data...')
 
-        analysis = stroke_analyzer.analyze_video(poses)
+        # Post-process pose data: fill missing detections, filter implausible movements
+        smooth_pose_data(poses)
+
+        _set_status(video_id, progress=50, message=f'Analyzing {stroke_label} mechanics...')
+
+        analysis = analyzer.analyze_video(poses)
         _set_status(video_id, progress=65, message='Generating annotated video...')
 
         visualizer.create_annotated_video(poses, output_path, analysis, input_path)
+        _set_status(video_id, progress=75, message='Exporting per-frame datapoints...')
+
+        # Export per-frame datapoints as CSV for offline analysis
+        datapoints_path = os.path.join(RESULTS_FOLDER, f'{video_id}_datapoints.csv')
+        export_datapoints_csv(poses, datapoints_path)
+
         _set_status(video_id, progress=85, message='Re-encoding for browser...')
 
         # Best-effort ffmpeg re-encode; non-fatal if ffmpeg is absent
@@ -188,13 +208,13 @@ def _process_video(video_id: str, input_path: str, output_path: str, report_path
 
         _set_status(video_id, progress=92, message='Generating report...')
 
-        report = feedback_generator.generate_report(analysis)
+        report = feedback_generator.generate_report(analysis, stroke_type)
         with open(report_path, 'w') as fh:
             fh.write(report)
 
         _set_status(video_id, status='completed', progress=100,
                     message='Analysis complete!')
-        logger.info(f"[{video_id}] Analysis completed successfully")
+        logger.info(f"[{video_id}] {stroke_label} analysis completed successfully")
 
     except Exception as exc:
         import traceback
@@ -231,6 +251,10 @@ def upload_video():
     if not _allowed_file(file.filename):
         return jsonify({'error': 'Invalid file type. Allowed: MP4, AVI, MOV'}), 400
 
+    stroke_type = request.form.get('stroke', 'freestyle')
+    if stroke_type not in ('freestyle', 'butterfly'):
+        stroke_type = 'freestyle'
+
     video_id = str(uuid.uuid4())
     filename = secure_filename(file.filename)
     ext = filename.rsplit('.', 1)[1].lower()
@@ -253,8 +277,8 @@ def upload_video():
             'message': 'Upload complete, queued for analysis...',
         }
 
-    executor.submit(_process_video, video_id, input_path, output_path, report_path)
-    logger.info(f"[{video_id}] Queued for analysis (from {client_ip})")
+    executor.submit(_process_video, video_id, input_path, output_path, report_path, stroke_type)
+    logger.info(f"[{video_id}] Queued for {stroke_type} analysis (from {client_ip})")
 
     return jsonify({'video_id': video_id, 'message': 'Upload successful, analysis queued'}), 200
 
@@ -282,6 +306,14 @@ def get_result_video(video_id):
             return send_file(alt_path, mimetype=mimetype, as_attachment=False)
 
     return jsonify({'error': 'Video result not found'}), 404
+
+
+@app.route('/api/result/<video_id>/datapoints', methods=['GET'])
+def get_result_datapoints(video_id):
+    datapoints_path = os.path.join(RESULTS_FOLDER, f'{video_id}_datapoints.csv')
+    if not os.path.exists(datapoints_path):
+        return jsonify({'error': 'Datapoints not found'}), 404
+    return send_file(datapoints_path, mimetype='text/csv', as_attachment=False)
 
 
 @app.route('/api/result/<video_id>/report', methods=['GET'])

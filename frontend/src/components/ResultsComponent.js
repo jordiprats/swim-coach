@@ -275,10 +275,23 @@ function ResultsComponent({ videoId, onReset }) {
             style={{
               textDecoration: 'none',
               display: 'inline-block',
-              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
+              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              marginRight: '10px'
             }}
           >
             📥 Download Video
+          </a>
+          <a
+            href={`${API_BASE_URL}/result/${videoId}/datapoints`}
+            download
+            className="button"
+            style={{
+              textDecoration: 'none',
+              display: 'inline-block',
+              background: 'linear-gradient(135deg, #36B37E 0%, #1B8A5E 100%)'
+            }}
+          >
+            📊 Download Datapoints
           </a>
         </div>
       </div>
