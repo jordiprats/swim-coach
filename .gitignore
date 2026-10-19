@@ -31,3 +31,5 @@ design_recommendations/
 *.key
 *_api_key.txt
 GEMINI_API_KEY
+
+.venv
