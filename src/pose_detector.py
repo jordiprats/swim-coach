@@ -56,6 +56,11 @@ class PoseDetector:
 
         # Extract landmark coordinates
         h, w, _ = frame.shape
+        # MediaPipe's z is normalized to body size (same scale as x,y before
+        # denormalization).  To use it alongside pixel-space x/y for 3D angle
+        # calculations, we scale it by the frame height (which approximates
+        # body height in pixels).
+        z_scale = h  # z is ~[-0.5, 0.5]; scaled to pixels
         landmarks = {}
 
         for name, idx in self.LANDMARKS.items():
@@ -63,7 +68,7 @@ class PoseDetector:
             landmarks[name] = {
                 'x': landmark.x * w,
                 'y': landmark.y * h,
-                'z': landmark.z,  # Relative depth
+                'z': landmark.z * z_scale,  # Depth in pixel-space units
                 'visibility': landmark.visibility
             }
 
@@ -73,7 +78,7 @@ class PoseDetector:
             'frame_shape': (h, w)
         }
 
-    def process_video(self, video_path: str, skip_frames: int = 2) -> List[Dict]:
+    def process_video(self, video_path: str, skip_frames: int = 1) -> List[Dict]:
         """
         Process video and extract pose data (skips frames for speed).
 
@@ -125,28 +130,39 @@ class PoseDetector:
 
         return pose_data
 
-    def calculate_angle(self, point1: Dict, point2: Dict, point3: Dict) -> float:
+    def calculate_angle(self, point1: Dict, point2: Dict, point3: Dict, use_3d: bool = True) -> float:
         """
-        Calculate angle between three points.
+        Calculate angle between three points, optionally using 3D coordinates.
+
+        When use_3d=True (default), uses (x, y, z) as a 3D vector. This accounts
+        for foreshortening and body roll — critical for swimming analysis where
+        arms move toward/away from the camera during the pull phase.
+
+        When use_3d=False, uses only (x, y) for 2D projection angle (legacy).
 
         Args:
-            point1, point2, point3: Landmark dictionaries with 'x' and 'y' keys
+            point1, point2, point3: Landmark dictionaries with 'x', 'y' keys
             point2 is the vertex of the angle
+            use_3d: If True, uses x/y/z for 3D angle; if False, uses x/y only
 
         Returns:
             Angle in degrees
         """
-        # Convert to numpy arrays
-        p1 = np.array([point1['x'], point1['y']])
-        p2 = np.array([point2['x'], point2['y']])
-        p3 = np.array([point3['x'], point3['y']])
+        if use_3d:
+            p1 = np.array([point1.get('x', 0), point1.get('y', 0), point1.get('z', 0)])
+            p2 = np.array([point2.get('x', 0), point2.get('y', 0), point2.get('z', 0)])
+            p3 = np.array([point3.get('x', 0), point3.get('y', 0), point3.get('z', 0)])
+        else:
+            p1 = np.array([point1['x'], point1['y']])
+            p2 = np.array([point2['x'], point2['y']])
+            p3 = np.array([point3['x'], point3['y']])
 
         # Calculate vectors
         v1 = p1 - p2
         v2 = p3 - p2
 
         # Calculate angle
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
         cos_angle = np.clip(cos_angle, -1.0, 1.0)  # Handle numerical errors
         angle = np.arccos(cos_angle)
 

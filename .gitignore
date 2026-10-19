@@ -14,6 +14,7 @@ build/
 *.mov
 !examples/*.mp4
 output/
+.venv/*
 
 # Web app specific
 backend/uploads/
