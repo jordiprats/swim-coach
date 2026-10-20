@@ -15,6 +15,12 @@ from src.models.butterfly_rules import (
     get_severity_emoji as bf_get_severity_emoji,
     get_severity_label as bf_get_severity_label,
 )
+from src.models.backstroke_rules import (
+    BackstrokeIssue,
+    HIP_DROP_MAX as BK_HIP_DROP_MAX,
+    get_severity_emoji as bk_get_severity_emoji,
+    get_severity_label as bk_get_severity_label,
+)
 
 
 class FeedbackGenerator:
@@ -37,6 +43,7 @@ class FeedbackGenerator:
         is_precision = cycles is not None and len(cycles) > 0
 
         is_butterfly = stroke_type == 'butterfly' or 'undulation' in metrics
+        is_backstroke = stroke_type == 'backstroke' or 'body_line' in metrics
 
         report = []
 
@@ -52,12 +59,15 @@ class FeedbackGenerator:
         if is_butterfly:
             sev_emoji = bf_get_severity_emoji
             sev_label = bf_get_severity_label
+        elif is_backstroke:
+            sev_emoji = bk_get_severity_emoji
+            sev_label = bk_get_severity_label
         else:
             sev_emoji = fs_get_severity_emoji
             sev_label = fs_get_severity_label
 
         # ====== HEADER WITH SCORE ======
-        stroke_label = "BUTTERFLY" if is_butterfly else "FREESTYLE"
+        stroke_label = "BUTTERFLY" if is_butterfly else "BACKSTROKE" if is_backstroke else "FREESTYLE"
         report.append(f"\U0001f3ca\u200d\u2642\ufe0f YOUR {stroke_label} ANALYSIS")
         if is_precision:
             report.append(f"   Mode: PRECISION (cycle-based, {len(cycles)} cycles detected)")
@@ -66,7 +76,7 @@ class FeedbackGenerator:
         report.append("")
 
         # ====== QUICK INSIGHT (THE HOOK) ======
-        insight = self._generate_quick_insight(rating, critical_issues, moderate_issues, is_butterfly)
+        insight = self._generate_quick_insight(rating, critical_issues, moderate_issues, is_butterfly, is_backstroke)
         report.append("\u2500" * 36)
         report.append("\U0001f4ca QUICK INSIGHT")
         report.append("\u2500" * 36)
@@ -268,7 +278,7 @@ class FeedbackGenerator:
 
         return max(1, min(10, int(round(score))))
 
-    def _generate_quick_insight(self, rating: int, critical_issues: List, moderate_issues: List, is_butterfly: bool = False) -> str:
+    def _generate_quick_insight(self, rating: int, critical_issues: List, moderate_issues: List, is_butterfly: bool = False, is_backstroke: bool = False) -> str:
         """Generate a quick, shareable insight about the swim."""
         if rating >= 9:
             return "\U0001f3c6 Your technique is Olympic-level! Maintain this form and focus on consistency."
@@ -294,6 +304,7 @@ class FeedbackGenerator:
 
         # Detect stroke type from available metrics
         is_butterfly = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
+        is_backstroke = 'body_line' in metrics and metrics['body_line'].get('hip_drop') is not None
 
         if is_butterfly:
             # --- Butterfly strengths ---
@@ -334,6 +345,41 @@ class FeedbackGenerator:
                 if 0.05 <= lift <= 0.08:
                     strengths.append("Controlled breathing — minimal head lift!")
 
+        elif is_backstroke:
+            # --- Backstroke strengths ---
+            if metrics.get('elbow', {}).get('avg_angle'):
+                angle = metrics['elbow']['avg_angle']
+                if 120 <= angle <= 150:
+                    strengths.append("Good elbow bend at catch — maintaining leverage!")
+
+            if metrics.get('rotation', {}).get('avg_rotation'):
+                rotation = metrics['rotation']['avg_rotation']
+                if 30 <= rotation <= 55:
+                    strengths.append("Good body rotation — arm clearing water cleanly!")
+
+            if metrics.get('synchronization', {}).get('timing_ok') is True:
+                strengths.append("Arms well timed — opposite arm rhythm correct!")
+
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']['avg_recovery_height']
+                if rec is not None and 0.03 <= rec <= 0.20:
+                    strengths.append("Controlled arm recovery — good clearance!")
+
+            if metrics.get('head', {}).get('stability'):
+                stability = metrics['head']['stability']
+                if stability > 0.8:
+                    strengths.append("Solid head position — stable and relaxed!")
+
+            if metrics.get('stroke_rate', {}).get('spm'):
+                spm = metrics['stroke_rate']['spm']
+                if 40 <= spm <= 60:
+                    strengths.append("Optimal stroke rate — nice rhythm!")
+
+            if metrics.get('body_line', {}).get('hip_drop') is not None:
+                hip_drop = metrics['body_line']['hip_drop']
+                if hip_drop is not None and hip_drop <= BK_HIP_DROP_MAX:
+                    strengths.append("Good body line — hips staying high!")
+
         else:
             # --- Freestyle strengths ---
             if metrics.get('elbow', {}).get('avg_angle'):
@@ -363,11 +409,13 @@ class FeedbackGenerator:
         return strengths
 
     def _format_metrics(self, metrics: Dict) -> str:
-        """Format metrics section (handles both freestyle and butterfly)."""
+        """Format metrics section (handles freestyle, butterfly, and backstroke)."""
         lines = []
 
         # Detect stroke type
         is_butterfly = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
+        is_backstroke = 'body_line' in metrics and (metrics['body_line'].get('body_line_angle_deviation') is not None or
+                                                     metrics['body_line'].get('hip_drop') is not None)
 
         # Detect precision mode
         is_precision = metrics.get('num_cycles', 0) > 0 or metrics.get('catch', {}).get('catch_elbow_angle', {}).get('value') is not None
@@ -419,6 +467,9 @@ class FeedbackGenerator:
             if is_butterfly:
                 lines.append(f"\U0001f7b8 Elbow Pull Angle:")
                 lines.append(f"   Average: {elbow['avg_angle']:.1f}\u00b0 (optimal: 120-160\u00b0)")
+            elif is_backstroke:
+                lines.append(f"\U0001f7b8 Elbow Angle:")
+                lines.append(f"   Average: {elbow['avg_angle']:.1f}\u00b0 (optimal catch: 120-150\u00b0)")
             else:
                 lines.append(f"\U0001f7b8 Elbow Catch Angle:")
                 lines.append(f"   Average: {elbow['avg_angle']:.1f}\u00b0 (optimal: 80-100\u00b0)")
@@ -454,7 +505,6 @@ class FeedbackGenerator:
                 lines.append(f"   Avg elbow diff: {sync['sync_delta']:.1f}° ({status})")
                 lines.append("")
 
-            # --- New butterfly metrics ---
             if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
                 rec = metrics['recovery']
                 lines.append(f"\U0001f7b8 Arm Recovery Height:")
@@ -491,6 +541,54 @@ class FeedbackGenerator:
                 lines.append(f"\U0001f7b8 Breathing Timing:")
                 lines.append(f"   Breath-to-entry gap: {bt['breath_to_entry_gap']:.1f} frames ({status})")
                 lines.append("")
+
+        elif is_backstroke:
+            # --- Backstroke-specific metrics ---
+            if metrics.get('entry', {}).get('avg_entry_width') is not None:
+                entry = metrics['entry']
+                lines.append(f"\U0001f7b8 Arm Entry Width:")
+                lines.append(f"   Avg wrist span: {entry['avg_entry_width']:.2f}x frame width (optimal: 0.15-0.30)")
+                lines.append("")
+
+            if metrics.get('rotation', {}).get('avg_rotation') is not None:
+                rotation = metrics['rotation']
+                lines.append(f"\U0001f7b8 Body Rotation:")
+                lines.append(f"   Average: {rotation['avg_rotation']:.1f}\u00b0 (optimal: 30-55\u00b0)")
+                if rotation.get('min_rotation') is not None and rotation.get('max_rotation') is not None:
+                    lines.append(f"   Range: {rotation['min_rotation']:.1f}\u00b0 - {rotation['max_rotation']:.1f}\u00b0")
+                lines.append("")
+
+            if metrics.get('synchronization', {}).get('phase_gap') is not None:
+                sync = metrics['synchronization']
+                status = "Opposite" if sync['timing_ok'] else "Off"
+                lines.append(f"\U0001f7b8 Arm Timing:")
+                lines.append(f"   Phase gap: {sync['phase_gap']:.2f} of cycle ({status}, ideal: ~0.45)")
+                lines.append(f"   Left peaks: {sync['num_left_peaks']} | Right peaks: {sync['num_right_peaks']}")
+                lines.append("")
+
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']
+                lines.append(f"\U0001f7b8 Arm Recovery Clearance:")
+                lines.append(f"   Avg clearance: {rec['avg_recovery_height']:.2f} of frame height (optimal: 0.03-0.20)")
+                if rec.get('min_recovery_height') is not None:
+                    lines.append(f"   Min clearance: {rec['min_recovery_height']:.2f}")
+                if rec.get('max_recovery_height') is not None:
+                    lines.append(f"   Max clearance: {rec['max_recovery_height']:.2f}")
+                lines.append("")
+
+            if metrics.get('body_line', {}).get('body_line_angle_deviation') is not None:
+                bl = metrics['body_line']
+                lines.append(f"\U0001f7b8 Body Line:")
+                lines.append(f"   Angle deviation: {bl['body_line_angle_deviation']:.1f}° from straight (optimal < 15°)")
+                if bl.get('hip_drop') is not None:
+                    lines.append(f"   Hip drop: {bl['hip_drop']:.3f}x torso length")
+                lines.append("")
+            elif metrics.get('body_line', {}).get('hip_drop') is not None:
+                bl = metrics['body_line']
+                lines.append(f"\U0001f7b8 Body Line:")
+                lines.append(f"   Hip drop: {bl['hip_drop']:.3f}x torso length (optimal < 0.03)")
+                lines.append("")
+
         else:
             # Freestyle-specific metrics
             if metrics.get('rotation', {}).get('avg_rotation') is not None:
@@ -500,12 +598,15 @@ class FeedbackGenerator:
                 lines.append(f"   Range: {rotation['min_rotation']:.1f}\u00b0 - {rotation['max_rotation']:.1f}\u00b0")
                 lines.append("")
 
-        # Stroke rate (shared by both)
+        # Stroke rate (shared by all)
         if metrics.get('stroke_rate', {}).get('spm') is not None:
             sr = metrics['stroke_rate']
             if is_butterfly:
                 lines.append(f"\U0001f7b8 Stroke Rate:")
                 lines.append(f"   {sr['spm']:.1f} strokes/min (optimal butterfly: 30-55 SPM)")
+            elif is_backstroke:
+                lines.append(f"\U0001f7b8 Stroke Rate:")
+                lines.append(f"   {sr['spm']:.1f} strokes/min (optimal backstroke: 40-60 SPM)")
             else:
                 lines.append(f"\U0001f7b8 Stroke Rate:")
                 lines.append(f"   {sr['spm']:.1f} strokes/min (optimal: 50-60 SPM)")
@@ -524,12 +625,20 @@ class FeedbackGenerator:
             lines.append(f"\U0001f7b8 Breathing Lift: {head['breathing_lift']:.2f} of frame height (optimal < 0.08)")
             lines.append("")
 
+        if metrics.get('head', {}).get('chin_lift') is not None:
+            head = metrics['head']
+            lines.append(f"\U0001f7b8 Chin Position: {head['chin_lift']:.3f} of frame height (positive = chin tucked)")
+            lines.append("")
+
         # Kick
         if metrics.get('kick', {}).get('avg_knee_angle') is not None:
             kick = metrics['kick']
             if is_butterfly:
                 lines.append(f"\U0001f7b8 Dolphin Kick:")
                 lines.append(f"   Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (optimal: 120-150\u00b0)")
+            elif is_backstroke:
+                lines.append(f"\U0001f7b8 Flutter Kick:")
+                lines.append(f"   Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (optimal: 140-160\u00b0)")
             else:
                 lines.append(f"\U0001f7b8 Kick Mechanics:")
                 lines.append(f"   Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (should be near 170\u00b0)")

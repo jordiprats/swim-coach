@@ -1,36 +1,36 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
-venv/
 *.egg-info/
 dist/
 build/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# macOS
 .DS_Store
+
+# Video files (keep example videos)
 *.mp4
 *.avi
 *.mov
 !examples/*.mp4
-output/
-.venv/*
 
-# Web app specific
-backend/uploads/
-backend/results/
-frontend/node_modules/
-frontend/build/
+# Generated outputs
+output/
+
+# Analysis reports
 *_report.txt
 *_analyzed.*
-
-# Design assistant outputs
-design_recommendations/
 
 # API keys and secrets (NEVER COMMIT!)
 .env
 *.key
 *_api_key.txt
 GEMINI_API_KEY
-
-.venv

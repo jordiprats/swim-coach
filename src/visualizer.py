@@ -87,6 +87,9 @@ class Visualizer:
         self._undulation_trace = []
         self._is_butterfly = ('undulation' in analysis_results.get('metrics', {}) and
                               analysis_results['metrics']['undulation'].get('undulation_amplitude') is not None)
+        self._is_backstroke = ('body_line' in analysis_results.get('metrics', {}) and
+                               (analysis_results['metrics']['body_line'].get('body_line_angle_deviation') is not None or
+                                analysis_results['metrics']['body_line'].get('hip_drop') is not None))
 
         # Build a fast lookup: frame_number -> pose
         pose_lookup = {fd['frame_number']: fd['pose'] for fd in pose_data}
@@ -209,6 +212,28 @@ class Visualizer:
                     cv2.circle(frame, (x, y), 4, self.COLOR_SKELETON, -1)
 
         # ── Butterfly-specific overlays ──
+        if self._is_backstroke:
+            # Backstroke: highlight the recovering arm (straight arm above shoulder)
+            # Also show body rotation indicator
+            arm_segments = [
+                ('left_shoulder', 'left_elbow'),
+                ('left_elbow', 'left_wrist'),
+                ('right_shoulder', 'right_elbow'),
+                ('right_elbow', 'right_wrist'),
+            ]
+            for (src, dst) in arm_segments:
+                src_lm = landmarks.get(src)
+                dst_lm = landmarks.get(dst)
+                if (src_lm and dst_lm and
+                    src_lm.get('visibility', 0) > 0.3 and
+                    dst_lm.get('visibility', 0) > 0.3):
+                    x1, y1 = int(src_lm['x']), int(src_lm['y'])
+                    x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
+                    cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 3)
+                    cv2.circle(frame, (x1, y1), 5, self.COLOR_BOTH_ARMS, -1)
+                    cv2.circle(frame, (x2, y2), 5, self.COLOR_BOTH_ARMS, -1)
+            return frame
+
         if not self._is_butterfly:
             return frame
 
@@ -281,9 +306,15 @@ class Visualizer:
         landmarks = pose['landmarks']
         metrics = analysis['metrics']
         is_bf = self._is_butterfly
+        is_bk = self._is_backstroke
 
         # Choose optimal elbow range based on stroke type
-        elbow_opt_min, elbow_opt_max, elbow_crit = (120, 160, 160) if is_bf else (80, 160, 120)
+        if is_bf:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (120, 160, 160)
+        elif is_bk:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (120, 150, 160)
+        else:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (80, 160, 120)
 
         # --- Elbow angles (left always, right too if butterfly) ---
         if metrics.get('elbow', {}).get('avg_angle') is not None:
@@ -302,8 +333,8 @@ class Visualizer:
                 color = self._get_angle_color(angle, elbow_opt_min, elbow_opt_max, elbow_crit, reverse=False)
                 self._draw_angle_annotation(frame, pos, angle, color)
 
-            # Right elbow (butterfly shows both; freestyle shows left only)
-            if is_bf and (landmarks['right_shoulder']['visibility'] > 0.3 and
+            # Right elbow (butterfly and backstroke show both; freestyle shows left only)
+            if (is_bf or is_bk) and (landmarks['right_shoulder']['visibility'] > 0.3 and
                 landmarks['right_elbow']['visibility'] > 0.3 and
                 landmarks['right_wrist']['visibility'] > 0.3):
 
@@ -315,6 +346,23 @@ class Visualizer:
                 pos = (int(landmarks['right_elbow']['x']), int(landmarks['right_elbow']['y']))
                 color = self._get_angle_color(angle, elbow_opt_min, elbow_opt_max, elbow_crit, reverse=False)
                 self._draw_angle_annotation(frame, pos, angle, color)
+
+        # --- Backstroke timing indicator ---
+        if is_bk and metrics.get('synchronization', {}).get('phase_gap') is not None:
+            left_wrist = landmarks.get('left_wrist')
+            right_wrist = landmarks.get('right_wrist')
+            if (left_wrist and right_wrist and
+                left_wrist['visibility'] > 0.3 and
+                right_wrist['visibility'] > 0.3):
+                lx = left_wrist['x']
+                rx = right_wrist['x']
+                mid_x = int((lx + rx) / 2)
+                mid_y = int((left_wrist['y'] + right_wrist['y']) / 2)
+                timing_ok = metrics['synchronization'].get('timing_ok', False)
+                label = "TIMING OK" if timing_ok else "TIMING OFF"
+                color = self.COLOR_SKELETON if timing_ok else self.COLOR_CRITICAL
+                self._draw_text(frame, label, (mid_x - 25, mid_y - 10),
+                                scale=0.5, color=color, thickness=2)
 
         # --- Butterfly sync indicator (badge between wrists) ---
         if is_bf and metrics.get('synchronization', {}).get('sync_delta') is not None:
@@ -365,13 +413,22 @@ class Visualizer:
         # ── Build fixed line list ──
         lines = []
         is_bf = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
+        is_bk = 'body_line' in metrics and (metrics['body_line'].get('body_line_angle_deviation') is not None or
+                                             metrics['body_line'].get('hip_drop') is not None)
 
         # Choose optimal elbow range based on stroke type
-        elbow_opt_min, elbow_opt_max, elbow_crit = (120, 160, 160) if is_bf else (80, 160, 120)
+        if is_bf:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (120, 160, 160)
+        elif is_bk:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (120, 150, 160)
+        else:
+            elbow_opt_min, elbow_opt_max, elbow_crit = (80, 160, 120)
 
         # 1. Title
         if is_bf:
             lines.append(("BUTTERFLY ANALYSIS", self.COLOR_TEXT, 0.6, 2))
+        elif is_bk:
+            lines.append(("BACKSTROKE ANALYSIS", self.COLOR_TEXT, 0.6, 2))
         else:
             lines.append(("FREESTYLE ANALYSIS", self.COLOR_TEXT, 0.6, 2))
 
@@ -413,7 +470,7 @@ class Visualizer:
         vis_count = sum(1 for lm in landmarks.values() if lm.get('visibility', 0) > 0.3)
         lines.append((f"Keypoints: {vis_count}/33", self.COLOR_TEXT, 0.5, 1))
 
-        # 5. Live per-frame elbow diff (sync indicator)
+        # 5. Live per-frame elbow diff (sync indicator for butterfly/backstroke)
         left_sh = landmarks.get('left_shoulder')
         left_el = landmarks.get('left_elbow')
         left_wr = landmarks.get('left_wrist')
@@ -441,77 +498,124 @@ class Visualizer:
         else:
             lines.append(("Avg elbow: ---", self.COLOR_TEXT, 0.4, 1))
 
-        # 7. Butterfly recovery height
-        if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
-            rec = metrics['recovery']['avg_recovery_height']
-            color = self.COLOR_CRITICAL if rec > 0.25 else self.COLOR_TEXT
-            lines.append((f"Recovery: {rec:.2f}h", color, 0.4, 1))
-        else:
-            lines.append(("Recovery: ---", self.COLOR_TEXT, 0.4, 1))
-
-        # 8. Butterfly shoulder-hip phase
-        if metrics.get('shoulder_hip_phase', {}).get('phase_lag') is not None:
-            phase = metrics['shoulder_hip_phase']
-            status = "wave" if not phase['in_phase'] else "no wave"
-            color = self.COLOR_SKELETON if not phase['in_phase'] else self.COLOR_CRITICAL
-            lines.append((f"Phase: {phase['phase_lag']:.2f} ({status}) {phase['cross_correlation']:.2f}", color, 0.35, 1))
-        else:
-            lines.append(("Phase: ---", self.COLOR_TEXT, 0.4, 1))
-
-        # 9. Butterfly hip during breath
-        if metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
-            hd = metrics['hip_during_breath']['hip_drop']
-            color = self.COLOR_CRITICAL if hd > 0.06 else self.COLOR_TEXT
-            lines.append((f"Hip drop: {hd:.3f}", color, 0.4, 1))
-        else:
-            lines.append(("Hip drop: ---", self.COLOR_TEXT, 0.4, 1))
-
-        # 10. Butterfly coordination
-        if metrics.get('coordination', {}).get('coordination_gap') is not None:
-            coord = metrics['coordination']
-            status = "ok" if coord['aligned'] else "mis"
-            color = self.COLOR_SKELETON if coord['aligned'] else self.COLOR_CRITICAL
-            lines.append((f"Coordination: {coord['coordination_gap']:.0f}f ({status})", color, 0.4, 1))
-        else:
-            lines.append(("Coordination: ---", self.COLOR_TEXT, 0.4, 1))
-
-        # 11. Butterfly breathing timing
-        if metrics.get('breathing_timing', {}).get('breath_to_entry_gap') is not None:
-            bt = metrics['breathing_timing']
-            status = "ok" if not bt['late_breathing'] else "late"
-            color = self.COLOR_SKELETON if not bt['late_breathing'] else self.COLOR_CRITICAL
-            lines.append((f"Breath: {bt['breath_to_entry_gap']:.0f}f ({status})", color, 0.4, 1))
-        else:
-            lines.append(("Breath: ---", self.COLOR_TEXT, 0.4, 1))
-
-        # 12. Butterfly undulation
-        if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
-            amp = metrics['undulation']['undulation_amplitude']
-            lines.append((f"Undulation: {amp:.3f}", self.COLOR_TEXT, 0.5, 1))
-        else:
-            lines.append(("Undulation: ---", self.COLOR_TEXT, 0.5, 1))
-
-        # 13. Butterfly arm synchronisation (video-wide + recent window)
-        if metrics.get('synchronization', {}).get('sync_delta') is not None:
-            delta = metrics['synchronization']['sync_delta']
-            recent = metrics['synchronization'].get('recent_sync_delta')
-            sync_status = metrics['synchronization'].get('synchronized', False)
-            color = self.COLOR_SKELETON if sync_status else self.COLOR_CRITICAL
-            if recent is not None:
-                lines.append((f"Sync: {delta:.1f}° (recent {recent:.1f}°)", color, 0.4, 1))
+        # ── Backstroke-specific lines ──
+        if is_bk:
+            # 7. Body rotation
+            if metrics.get('rotation', {}).get('avg_rotation') is not None:
+                rot = metrics['rotation']['avg_rotation']
+                lines.append((f"Rotation: {rot:.0f}°", self.COLOR_TEXT, 0.5, 1))
             else:
-                lines.append((f"Sync: {delta:.1f}°", color, 0.4, 1))
-        else:
-            lines.append(("Sync: ---", self.COLOR_TEXT, 0.4, 1))
+                lines.append(("Rotation: ---", self.COLOR_TEXT, 0.5, 1))
 
-        # 14. Butterfly entry width
-        if metrics.get('entry', {}).get('avg_entry_width') is not None:
-            ew = metrics['entry']['avg_entry_width']
-            lines.append((f"Entry Width: {ew:.2f}x", self.COLOR_TEXT, 0.5, 1))
-        else:
-            lines.append(("Entry Width: ---", self.COLOR_TEXT, 0.5, 1))
+            # 8. Arm timing
+            if metrics.get('synchronization', {}).get('phase_gap') is not None:
+                sync = metrics['synchronization']
+                status = "ok" if sync['timing_ok'] else "off"
+                color = self.COLOR_SKELETON if sync['timing_ok'] else self.COLOR_CRITICAL
+                lines.append((f"Timing: {sync['phase_gap']:.2f} ({status})", color, 0.5, 1))
+            else:
+                lines.append(("Timing: ---", self.COLOR_TEXT, 0.5, 1))
 
-        # 15. Stroke rate
+            # 9. Recovery clearance
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']['avg_recovery_height']
+                color = self.COLOR_CRITICAL if rec > 0.25 or rec < 0.03 else self.COLOR_TEXT
+                lines.append((f"Recovery: {rec:.2f}h", color, 0.5, 1))
+            else:
+                lines.append(("Recovery: ---", self.COLOR_TEXT, 0.5, 1))
+
+            # 10. Body line
+            if metrics.get('body_line', {}).get('body_line_angle_deviation') is not None:
+                dev = metrics['body_line']['body_line_angle_deviation']
+                color = self.COLOR_CRITICAL if dev > 15 else self.COLOR_TEXT
+                lines.append((f"Body line: {dev:.1f}° dev", color, 0.5, 1))
+            elif metrics.get('body_line', {}).get('hip_drop') is not None:
+                hd = metrics['body_line']['hip_drop']
+                color = self.COLOR_CRITICAL if hd > 0.03 else self.COLOR_TEXT
+                lines.append((f"Hip drop: {hd:.3f}", color, 0.5, 1))
+            else:
+                lines.append(("Hip drop: ---", self.COLOR_TEXT, 0.5, 1))
+
+            # 11. Entry width
+            if metrics.get('entry', {}).get('avg_entry_width') is not None:
+                ew = metrics['entry']['avg_entry_width']
+                lines.append((f"Entry: {ew:.2f}w", self.COLOR_TEXT, 0.5, 1))
+            else:
+                lines.append(("Entry: ---", self.COLOR_TEXT, 0.5, 1))
+
+        else:
+            # ── Butterfly / Freestyle lines ──
+            # 7. Butterfly recovery height
+            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+                rec = metrics['recovery']['avg_recovery_height']
+                color = self.COLOR_CRITICAL if rec > 0.25 else self.COLOR_TEXT
+                lines.append((f"Recovery: {rec:.2f}h", color, 0.4, 1))
+            else:
+                lines.append(("Recovery: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 8. Butterfly shoulder-hip phase
+            if metrics.get('shoulder_hip_phase', {}).get('phase_lag') is not None:
+                phase = metrics['shoulder_hip_phase']
+                status = "wave" if not phase['in_phase'] else "no wave"
+                color = self.COLOR_SKELETON if not phase['in_phase'] else self.COLOR_CRITICAL
+                lines.append((f"Phase: {phase['phase_lag']:.2f} ({status}) {phase['cross_correlation']:.2f}", color, 0.35, 1))
+            else:
+                lines.append(("Phase: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 9. Butterfly hip during breath
+            if metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
+                hd = metrics['hip_during_breath']['hip_drop']
+                color = self.COLOR_CRITICAL if hd > 0.06 else self.COLOR_TEXT
+                lines.append((f"Hip drop: {hd:.3f}", color, 0.4, 1))
+            else:
+                lines.append(("Hip drop: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 10. Butterfly coordination
+            if metrics.get('coordination', {}).get('coordination_gap') is not None:
+                coord = metrics['coordination']
+                status = "ok" if coord['aligned'] else "mis"
+                color = self.COLOR_SKELETON if coord['aligned'] else self.COLOR_CRITICAL
+                lines.append((f"Coordination: {coord['coordination_gap']:.0f}f ({status})", color, 0.4, 1))
+            else:
+                lines.append(("Coordination: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 11. Butterfly breathing timing
+            if metrics.get('breathing_timing', {}).get('breath_to_entry_gap') is not None:
+                bt = metrics['breathing_timing']
+                status = "ok" if not bt['late_breathing'] else "late"
+                color = self.COLOR_SKELETON if not bt['late_breathing'] else self.COLOR_CRITICAL
+                lines.append((f"Breath: {bt['breath_to_entry_gap']:.0f}f ({status})", color, 0.4, 1))
+            else:
+                lines.append(("Breath: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 12. Butterfly undulation
+            if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
+                amp = metrics['undulation']['undulation_amplitude']
+                lines.append((f"Undulation: {amp:.3f}", self.COLOR_TEXT, 0.5, 1))
+            else:
+                lines.append(("Undulation: ---", self.COLOR_TEXT, 0.5, 1))
+
+            # 13. Butterfly arm synchronisation (video-wide + recent window)
+            if metrics.get('synchronization', {}).get('sync_delta') is not None:
+                delta = metrics['synchronization']['sync_delta']
+                recent = metrics['synchronization'].get('recent_sync_delta')
+                sync_status = metrics['synchronization'].get('synchronized', False)
+                color = self.COLOR_SKELETON if sync_status else self.COLOR_CRITICAL
+                if recent is not None:
+                    lines.append((f"Sync: {delta:.1f}° (recent {recent:.1f}°)", color, 0.4, 1))
+                else:
+                    lines.append((f"Sync: {delta:.1f}°", color, 0.4, 1))
+            else:
+                lines.append(("Sync: ---", self.COLOR_TEXT, 0.4, 1))
+
+            # 14. Butterfly entry width
+            if metrics.get('entry', {}).get('avg_entry_width') is not None:
+                ew = metrics['entry']['avg_entry_width']
+                lines.append((f"Entry Width: {ew:.2f}x", self.COLOR_TEXT, 0.5, 1))
+            else:
+                lines.append(("Entry Width: ---", self.COLOR_TEXT, 0.5, 1))
+
+        # 15. Stroke rate (shared by all)
         if metrics.get('stroke_rate', {}).get('spm') is not None:
             spm = metrics['stroke_rate']['spm']
             lines.append((f"Stroke Rate: {spm:.0f} SPM", self.COLOR_TEXT, 0.5, 1))

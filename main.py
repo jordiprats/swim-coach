@@ -23,7 +23,10 @@ from src.pose_detector import PoseDetector
 from src.fusion_pose_detector import FusionPoseDetector
 from src.video_processor import VideoProcessor
 from src.stroke_analyzer import StrokeAnalyzer
+from src.freestyle_analyzer import FreestyleAnalyzer
+from src.backstroke_analyzer import BackstrokeAnalyzer
 from src.butterfly_analyzer import ButterflyAnalyzer
+from src.breaststroke_analyzer import BreaststrokeAnalyzer
 from src.visualizer import Visualizer
 from src.feedback_generator import FeedbackGenerator
 from src.data_exporter import export_datapoints_csv
@@ -95,7 +98,7 @@ Examples:
 
     parser.add_argument(
         '--stroke',
-        choices=['freestyle', 'butterfly'],
+        choices=['freestyle', 'backstroke', 'butterfly', 'breaststroke'],
         default='freestyle',
         help='Type of stroke to analyze (default: freestyle)'
     )
@@ -242,7 +245,12 @@ Examples:
 
         if args.stroke == 'butterfly':
             analyzer = ButterflyAnalyzer()
+        elif args.stroke == 'backstroke':
+            analyzer = BackstrokeAnalyzer()
+        elif args.stroke == 'breaststroke':
+            analyzer = BreaststrokeAnalyzer()
         else:
+            # Freestyle uses legacy StrokeAnalyzer (backward compatible)
             analyzer = StrokeAnalyzer(use_cycle_detection=args.precision)
 
         analysis_results = analyzer.analyze_video(pose_data)
