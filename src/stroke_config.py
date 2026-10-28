@@ -47,6 +47,7 @@ CONFIGS: Dict[str, StrokeConfig] = {
             'elbow_pull_min_ok': 90,      # ° — minimum during pull
             'elbow_pull_max_ok': 120,     # ° — maximum during pull
             'elbow_dropped': 150,         # ° — flag if pull min > this
+            'recovery_elbow_max': 160,    # ° — flag if recovery elbow avg > this
             'breath_lift_max': 0.08,      # torso-normalised head lift
             'knee_bend_min': 120,         # ° — below this = too bent
             'knee_bend_max': 170,         # ° — above this = too straight
@@ -70,8 +71,9 @@ CONFIGS: Dict[str, StrokeConfig] = {
             'elbow_pull_min_ok': 90,
             'elbow_pull_max_ok': 120,
             'elbow_dropped': 150,
-            'recovery_height_min': 0.03,     # torso-normalised
-            'recovery_height_max': 0.20,     # torso-normalised
+            'recovery_elbow_max': 160,
+            'recovery_height_min': 0.03,
+            'recovery_height_max': 0.20,
             'knee_bend_min': 120,
             'knee_bend_max': 170,
             'hip_line_drop_max': 15,
@@ -91,11 +93,12 @@ CONFIGS: Dict[str, StrokeConfig] = {
             'recovery_height',
         ],
         thresholds={
-            'undulation_amp_min': 0.04,     # torso-normalised
+            'undulation_amp_min': 0.04,
             'undulation_amp_max': 0.12,
             'breath_lift_max': 0.08,
             'recovery_height_min': 0.03,
             'recovery_height_max': 0.20,
+            'recovery_elbow_max': 160,
         },
     ),
 

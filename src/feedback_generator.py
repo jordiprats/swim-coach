@@ -48,7 +48,11 @@ class FeedbackGenerator:
         report = []
 
         # Overall rating
-        rating = self._calculate_overall_rating(issues)
+        # Assess reliability
+        reliability = self._assess_reliability(metrics, issues)
+        unreliable = reliability['unreliable_metrics']
+
+        rating = self._calculate_overall_rating(issues, metrics)
 
         # Group issues by severity
         critical_issues = [i for i in issues if i.severity == SEVERITY_CRITICAL]
@@ -159,22 +163,15 @@ class FeedbackGenerator:
                 report.append(f"   \u2192 {issue.tip}")
                 report.append("")
 
-        # ====== CONFIDENCE NOTES ======
-        if is_precision:
-            # Check if any metrics have low confidence
-            low_conf_metrics = []
-            for key, val in metrics.items():
-                if isinstance(val, dict) and val.get('confidence') is not None:
-                    if val['confidence'] < 0.4:
-                        low_conf_metrics.append(f"{key} ({val['confidence']:.0%})")
-            if low_conf_metrics:
-                report.append("\U0001f4a1 CONFIDENCE NOTES")
-                report.append("\u2500" * 36)
-                report.append("  Some metrics have low confidence due to poor detection:")
-                for m in low_conf_metrics[:3]:
-                    report.append(f"  \u2022 {m}")
-                report.append("  Consider re-recording with better lighting/camera angle.")
-                report.append("")
+        # ====== RELIABILITY SECTION ======
+        if reliability['warnings']:
+            report.append("\U0001f4a1 RELIABILITY")
+            report.append("\u2500" * 36)
+            report.append("  Some metrics may be unreliable. Here's why:")
+            for _, msg in reliability['warnings']:
+                report.append(f"  \u26a0\ufe0f {msg}")
+            report.append("  Treat the scores as rough estimates — consider re-recording with better lighting/camera angle.")
+            report.append("")
 
         # ====== DETAILED BREAKDOWN (Collapsed by default in UI) ======
         if critical_issues or moderate_issues or minor_issues:
@@ -208,7 +205,7 @@ class FeedbackGenerator:
         # ====== METRICS ======
         report.append("\U0001f4ca YOUR NUMBERS")
         report.append("\u2500" * 36)
-        report.append(self._format_metrics(metrics))
+        report.append(self._format_metrics(metrics, unreliable))
         report.append("")
 
         # ====== NO ISSUES CELEBRATION ======
@@ -240,7 +237,8 @@ class FeedbackGenerator:
             Brief text summary
         """
         issues = analysis_results['issues']
-        rating = self._calculate_overall_rating(issues)
+        metrics = analysis_results.get('metrics', {})
+        rating = self._calculate_overall_rating(issues, metrics)
 
         critical_count = len([i for i in issues if i.severity == SEVERITY_CRITICAL])
         moderate_count = len([i for i in issues if i.severity == SEVERITY_MODERATE])
@@ -254,12 +252,13 @@ class FeedbackGenerator:
 
         return " | ".join(summary)
 
-    def _calculate_overall_rating(self, issues: List) -> int:
+    def _calculate_overall_rating(self, issues: List, metrics: Dict = None) -> int:
         """
         Calculate overall technique rating (1-10).
 
         Args:
-            issues: List of detected issues (FreestyleIssue or ButterflyIssue)
+            issues: List of detected issues
+            metrics: Optional metrics dict for reliability gating
 
         Returns:
             Rating from 1-10
@@ -276,7 +275,113 @@ class FeedbackGenerator:
             elif issue.severity == SEVERITY_MINOR:
                 score -= 0.5
 
+        # If detection quality is low, reduce score further
+        if metrics:
+            valid_ratio = metrics.get('valid_frame_ratio', 1.0)
+            num_cycles = metrics.get('num_cycles', 0)
+            if valid_ratio < 0.5:
+                score -= 2  # unreliable analysis
+            elif valid_ratio < 0.7:
+                score -= 1
+            if num_cycles < 3 and num_cycles > 0:
+                score -= 1  # too few cycles for reliable metrics
+
         return max(1, min(10, int(round(score))))
+
+    def _assess_reliability(self, metrics: Dict, issues: List = None) -> Dict:
+        """Assess reliability of each metric and overall analysis.
+
+        Returns a dict with:
+          - overall: 'high', 'medium', 'low'
+          - warnings: list of (metric_key, warning_message)
+          - unreliable_metrics: set of metric keys that are unreliable
+        """
+        warnings = []
+        unreliable = set()
+
+        valid_ratio = metrics.get('valid_frame_ratio', 1.0)
+        num_cycles = metrics.get('num_cycles', 0)
+
+        if valid_ratio < 0.5:
+            warnings.append(('detection_quality',
+                f'Detection quality is {valid_ratio:.1%} — more than half the frames were not analyzed'))
+        elif valid_ratio < 0.7:
+            warnings.append(('detection_quality',
+                f'Detection quality is {valid_ratio:.1%} — results may be shaky'))
+
+        if num_cycles < 5:
+            warnings.append(('sample_size',
+                f'Only {num_cycles} stroke cycles detected — very small sample for judging technique'))
+
+        # Check specific metric values for plausibility
+        # ── Elbow min pull ──
+        elbow = metrics.get('elbow_min_pull', {})
+        pull_min = elbow.get('pull_min')
+        if pull_min is not None and pull_min > 170:
+            warnings.append(('elbow_min_pull',
+                f'Elbow pull min {pull_min:.0f}° — arm nearly straight; pose tracker may have lost the arm underwater'))
+            unreliable.add('elbow_min_pull')
+
+        # ── Hip line deviation ──
+        hip = metrics.get('hip_line', {})
+        dev = hip.get('deviation')
+        # dev = 180° = perfectly straight; values < 90 mean the body is bent > 90°
+        # which is physically impossible for swimming (the hip joint can't bend that far)
+        if dev is not None and dev < 90:
+            warnings.append(('hip_line',
+                f'Hip deviation {dev:.1f}° — body appears severely bent; likely tracker confused'))
+            unreliable.add('hip_line')
+
+        # ── Recovery height min ──
+        rec = metrics.get('recovery_height', {})
+        rec_min = rec.get('min')
+        if rec_min is not None and rec_min < 0.01:
+            warnings.append(('recovery_height',
+                f'Recovery min {rec_min:.2f} — looks like a missing value, not a measurement'))
+            unreliable.add('recovery_height')
+
+        # ── Undulation amplitude (butterfly) ──
+        und = metrics.get('undulation', {})
+        amp = und.get('undulation_amplitude')
+        if amp is not None and amp > 1.0:
+            warnings.append(('undulation',
+                f'Dolphin amplitude {amp:.3f} — {amp:.0f}x the expected range; likely a units or normalization bug'))
+            unreliable.add('undulation')
+
+        # ── Stroke rate contradictions ──
+        sr = metrics.get('stroke_rate', {})
+        spm = sr.get('spm') if sr else None
+        if spm is not None and issues:
+            # Check if stroke rate is inside optimal range but flagged as too slow/fast
+            for issue in issues:
+                if 'stroke_rate' in issue.issue_type:
+                    if 30 <= spm <= 55:  # butterfly optimal range
+                        warnings.append(('stroke_rate',
+                            f'Stroke rate {spm:.0f} SPM is inside the optimal range (30-55) but flagged as "{issue.issue_type}"'))
+                        unreliable.add('stroke_rate')
+
+        # ── Knee angle ──
+        kick = metrics.get('kick', {})
+        avg_knee = kick.get('avg_knee_angle')
+        if avg_knee is not None and (avg_knee < 60 or avg_knee > 180):
+            warnings.append(('kick',
+                f'Knee angle {avg_knee:.0f}° — outside plausible range; tracking may be off'))
+            unreliable.add('kick')
+
+        # Overall reliability
+        num_warnings = len(warnings)
+        if num_warnings >= 3 or valid_ratio < 0.5:
+            overall = 'low'
+        elif num_warnings >= 1 or valid_ratio < 0.7:
+            overall = 'medium'
+        else:
+            overall = 'high'
+
+        return {
+            'overall': overall,
+            'warnings': warnings,
+            'unreliable_metrics': unreliable,
+        }
 
     def _generate_quick_insight(self, rating: int, critical_issues: List, moderate_issues: List, is_butterfly: bool = False, is_backstroke: bool = False) -> str:
         """Generate a quick, shareable insight about the swim."""
@@ -298,9 +403,10 @@ class FeedbackGenerator:
             else:
                 return "\U0001f4da You're just getting started! Follow the action plan and you'll see improvement quickly."
 
-    def _identify_strengths(self, metrics: Dict, issues: List) -> List[str]:
+    def _identify_strengths(self, metrics: Dict, issues: List, unreliable: set = None) -> List[str]:
         """Identify what the swimmer is doing well."""
         strengths = []
+        unreliable = unreliable or set()
 
         # Detect stroke type from available metrics
         is_butterfly = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
@@ -308,39 +414,39 @@ class FeedbackGenerator:
 
         if is_butterfly:
             # --- Butterfly strengths ---
-            if metrics.get('elbow', {}).get('avg_angle'):
+            if 'elbow' not in unreliable and metrics.get('elbow', {}).get('avg_angle'):
                 angle = metrics['elbow']['avg_angle']
                 if 120 <= angle <= 160:
                     strengths.append("Good elbow bend (3D) during pull — maintaining leverage!")
 
-            if metrics.get('undulation', {}).get('undulation_amplitude'):
+            if 'undulation' not in unreliable and metrics.get('undulation', {}).get('undulation_amplitude'):
                 amp = metrics['undulation']['undulation_amplitude']
                 if 0.04 <= amp <= 0.10:
                     strengths.append("Nice dolphin undulation — efficient wave motion!")
 
-            if metrics.get('synchronization', {}).get('synchronized') is True:
+            if 'synchronization' not in unreliable and metrics.get('synchronization', {}).get('synchronized') is True:
                 strengths.append("Arms are well synchronised — both hands entering together!")
 
-            if metrics.get('recovery', {}).get('avg_recovery_height') is not None:
+            if 'recovery' not in unreliable and metrics.get('recovery', {}).get('avg_recovery_height') is not None:
                 rec = metrics['recovery']['avg_recovery_height']
                 if rec is not None and rec <= 0.20:
                     strengths.append("Low arm recovery — efficient sweeping motion!")
 
-            if metrics.get('shoulder_hip_phase', {}).get('in_phase') is False:
+            if 'shoulder_hip_phase' not in unreliable and metrics.get('shoulder_hip_phase', {}).get('in_phase') is False:
                 strengths.append("Good body wave — shoulders and hips moving out of phase!")
 
-            if metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
+            if 'hip_during_breath' not in unreliable and metrics.get('hip_during_breath', {}).get('hip_drop') is not None:
                 hip_drop = metrics['hip_during_breath']['hip_drop']
                 if hip_drop is not None and hip_drop <= HIP_DROP_MAX:
                     strengths.append("Hips stay high during breath — great body line!")
 
-            if metrics.get('coordination', {}).get('aligned') is True:
+            if 'coordination' not in unreliable and metrics.get('coordination', {}).get('aligned') is True:
                 strengths.append("Kick and pull well timed — good two-kick rhythm!")
 
-            if metrics.get('breathing_timing', {}).get('late_breathing') is False:
+            if 'breathing_timing' not in unreliable and metrics.get('breathing_timing', {}).get('late_breathing') is False:
                 strengths.append("Breathing timing is good — head down before hands enter!")
 
-            if metrics.get('head', {}).get('breathing_lift'):
+            if 'head' not in unreliable and metrics.get('head', {}).get('breathing_lift'):
                 lift = metrics['head']['breathing_lift']
                 if 0.05 <= lift <= 0.08:
                     strengths.append("Controlled breathing — minimal head lift!")
@@ -408,9 +514,16 @@ class FeedbackGenerator:
 
         return strengths
 
-    def _format_metrics(self, metrics: Dict) -> str:
+    def _format_metrics(self, metrics: Dict, unreliable: set = None) -> str:
         """Format metrics section (handles freestyle, butterfly, and backstroke)."""
         lines = []
+        unreliable = unreliable or set()
+
+        # Helper to flag unreliable metrics
+        def warn_if_unreliable(key, value_str):
+            if key in unreliable:
+                return f"{value_str} \u26a0\ufe0f (may be unreliable)"
+            return value_str
 
         # Detect stroke type
         is_butterfly = 'undulation' in metrics and metrics['undulation'].get('undulation_amplitude') is not None
@@ -493,9 +606,10 @@ class FeedbackGenerator:
 
             if metrics.get('undulation', {}).get('undulation_amplitude') is not None:
                 und = metrics['undulation']
+                amp_str = f"Amplitude: {und['undulation_amplitude']:.3f} (optimal: 0.04-0.12)"
                 lines.append(f"\U0001f7b8 Dolphin Undulation:")
-                lines.append(f"   Amplitude: {und['undulation_amplitude']:.3f} (optimal: 0.04-0.12)")
-                lines.append(f"   Cycles detected: {und['undulation_cycles']}")
+                lines.append(f"   {warn_if_unreliable('undulation', amp_str)}")
+                lines.append(f"   Cycles detected: {und.get('undulation_cycles', und.get('num_hip_cycles', 0))}")
                 lines.append("")
 
             if metrics.get('synchronization', {}).get('sync_delta') is not None:
@@ -634,8 +748,9 @@ class FeedbackGenerator:
         if metrics.get('kick', {}).get('avg_knee_angle') is not None:
             kick = metrics['kick']
             if is_butterfly:
+                knee_str = f"Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (optimal: 120-150\u00b0)"
                 lines.append(f"\U0001f7b8 Dolphin Kick:")
-                lines.append(f"   Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (optimal: 120-150\u00b0)")
+                lines.append(f"   {warn_if_unreliable('kick', knee_str)}")
             elif is_backstroke:
                 lines.append(f"\U0001f7b8 Flutter Kick:")
                 lines.append(f"   Knee angle: {kick['avg_knee_angle']:.1f}\u00b0 (optimal: 140-160\u00b0)")
@@ -647,6 +762,11 @@ class FeedbackGenerator:
         # Video quality
         if metrics.get('valid_frame_ratio') is not None:
             valid_pct = metrics['valid_frame_ratio'] * 100
-            lines.append(f"\U0001f7b8 Detection Quality: {valid_pct:.1f}% of frames analyzed")
+            quality_str = f"Detection Quality: {valid_pct:.1f}% of frames analyzed"
+            if valid_pct < 50:
+                quality_str += " \u26a0\ufe0f Low — results may be unreliable"
+            elif valid_pct < 70:
+                quality_str += " \u26a0\ufe0f Moderate — treat with caution"
+            lines.append(f"\U0001f7b8 {quality_str}")
 
         return "\n".join(lines)

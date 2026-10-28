@@ -8,7 +8,7 @@ and provides coaching-quality feedback.
 Two modes:
   - Standard mode (default): fast, real-time-capable pipeline
   - Precision mode (--precision): trades speed for accuracy using:
-      * Advanced temporal smoothing (Savitzky–Golay + One Euro + Kalman)
+      * Advanced temporal smoothing (Savitzky-Golay + One Euro + Kalman)
       * Stroke-cycle segmentation with phase-specific metrics
       * Body-relative normalization
       * Confidence propagation through all metrics
@@ -153,6 +153,18 @@ Examples:
              'Trims video before analysis.'
     )
 
+    parser.add_argument(
+        '--lines-only',
+        action='store_true',
+        help='Render pose skeleton and annotations on a blank background (no video frames)'
+    )
+
+    parser.add_argument(
+        '--render-video',
+        action='store_true',
+        help='Generate a 4-panel rendered video with front, top, and side views of the swimmer'
+    )
+
     args = parser.parse_args()
 
     # Validate input file
@@ -285,9 +297,12 @@ Examples:
         # Step 4: Create annotated video
         if not args.report_only:
             print("Step 4/4: Creating annotated video...")
-            visualizer = Visualizer()
+            # Interpolate missing pose frames so the skeleton doesn't flicker
+            from src.base_analyzer import BaseAnalyzer
+            interpolated_pose = BaseAnalyzer._interpolate_missing_frames(pose_data, video_path=args.video)
+            visualizer = Visualizer(lines_only=args.lines_only)
             output_video = visualizer.create_annotated_video(
-                pose_data,
+                interpolated_pose,
                 args.output,
                 analysis_results,
                 args.video
@@ -299,6 +314,22 @@ Examples:
                 print("✓ Re-encoded to H.264 for browser compatibility")
             else:
                 print("  (ffmpeg not found — skipping browser re-encode)")
+
+            # ── 4-panel rendered video ──
+            if args.render_video:
+                render_path = os.path.splitext(args.output)[0] + '_render.mp4'
+                print(f"\nStep 4b/4: Creating 4-panel rendered video...")
+                # Use the original (non-interpolated) pose_data for 3D views
+                render_pose = BaseAnalyzer._interpolate_missing_frames(pose_data, video_path=args.video)
+                render_output = visualizer.create_annotated_video_4panel(
+                    render_pose,
+                    render_path,
+                    analysis_results,
+                    args.video
+                )
+                print(f"✓ Render video saved to: {render_output}")
+                if VideoProcessor.reencode_for_browser(render_output):
+                    print("✓ Re-encoded to H.264 for browser compatibility")
             print("")
         else:
             print("Step 4/4: Skipping video generation")

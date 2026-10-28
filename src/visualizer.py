@@ -8,8 +8,14 @@ from src.video_processor import VideoProcessor
 class Visualizer:
     """Creates annotated videos with pose overlays and metrics."""
 
-    def __init__(self):
-        """Initialize visualizer."""
+    def __init__(self, lines_only: bool = False):
+        """Initialize visualizer.
+
+        Args:
+            lines_only: If True, render pose skeleton and annotations on a blank
+                        background instead of the original video frames.
+        """
+        self.lines_only = lines_only
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_pose = mp.solutions.pose
         self.drawing_spec = self.mp_drawing.DrawingSpec(thickness=2, circle_radius=2)
@@ -93,6 +99,11 @@ class Visualizer:
 
         # Build a fast lookup: frame_number -> pose
         pose_lookup = {fd['frame_number']: fd['pose'] for fd in pose_data}
+        frame_numbers = sorted(pose_lookup.keys())
+        if not frame_numbers:
+            raise ValueError('No frame numbers in pose_data')
+        min_frame = frame_numbers[0]
+        max_frame = frame_numbers[-1]
 
         # Get video properties
         video_info = VideoProcessor(original_video_path).get_video_info()
@@ -115,7 +126,18 @@ class Visualizer:
         frame_idx = 0
         last_pose = None  # Forward-fill pose on frames that were skipped during analysis
 
-        while cap.isOpened():
+        # Pre-create blank canvas once (same size as video)
+        blank_canvas = np.zeros((video_info['height'], video_info['width'], 3), dtype=np.uint8)
+        if self.lines_only:
+            blank_canvas.fill(255)  # white background
+
+        # Seek to first frame with pose data
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min_frame)
+        frame_idx = min_frame
+        rendered_count = 0
+        last_pose = pose_lookup[min_frame]
+
+        while frame_idx <= max_frame:
             ret, frame = cap.read()
             if not ret:
                 break
@@ -125,19 +147,310 @@ class Visualizer:
                 last_pose = pose_lookup[frame_idx]
             pose = last_pose
 
+            # Decide which canvas to draw on
+            if self.lines_only:
+                canvas = blank_canvas.copy()
+            else:
+                canvas = frame
+
             # Draw pose if detected
             if pose is not None:
-                frame = self._draw_pose(frame, pose)
-                frame = self._draw_metrics_overlay(frame, pose, analysis_results)
+                canvas = self._draw_pose(canvas, pose)
+                canvas = self._draw_metrics_overlay(canvas, pose, analysis_results)
 
             # Draw overall stats in corner
-            frame = self._draw_stats_panel(frame, pose, analysis_results, frame_idx, total_frames)
+            canvas = self._draw_stats_panel(canvas, pose, analysis_results, frame_idx, total_frames)
 
-            writer.write(frame)
+            writer.write(canvas)
+            rendered_count += 1
             frame_idx += 1
 
-            if frame_idx % 30 == 0:
-                print(f"Rendered {frame_idx}/{total_frames} frames")
+            if rendered_count % 30 == 0:
+                print(f"Rendered {rendered_count}/{max_frame - min_frame + 1} frames")
+
+        cap.release()
+        writer.release()
+        print(f"Completed: {output_path}")
+
+        return output_path
+
+    def create_annotated_video_4panel(
+        self,
+        pose_data: List[Dict],
+        output_path: str,
+        analysis_results: Dict,
+        original_video_path: str
+    ) -> str:
+        """
+        Create a 4-panel annotated video:
+        - Top-left: original analyzed video (same as create_annotated_video)
+        - Top-right: front view of the swimmer (x-y projection)
+        - Bottom-left: top view (x-z projection, looking from above)
+        - Bottom-right: side view (y-z projection, looking from the side)
+
+        The 3D views keep the swimmer stationary and centered so technique
+        can be analysed without camera perspective distortion.
+        """
+        if not pose_data:
+            raise ValueError("No pose data to visualize")
+
+        # Reset per-video state
+        self._undulation_trace = []
+        self._is_butterfly = ('undulation' in analysis_results.get('metrics', {}) and
+                              analysis_results['metrics']['undulation'].get('undulation_amplitude') is not None)
+        self._is_backstroke = ('body_line' in analysis_results.get('metrics', {}) and
+                               (analysis_results['metrics']['body_line'].get('body_line_angle_deviation') is not None or
+                                analysis_results['metrics']['body_line'].get('hip_drop') is not None))
+
+        # Build pose lookup
+        pose_lookup = {fd['frame_number']: fd['pose'] for fd in pose_data}
+        frame_numbers = sorted(pose_lookup.keys())
+        if not frame_numbers:
+            raise ValueError('No frame numbers in pose_data')
+        min_frame = frame_numbers[0]
+        max_frame = frame_numbers[-1]
+
+        # Get video properties
+        video_info = VideoProcessor(original_video_path).get_video_info()
+        orig_w = video_info['width']
+        orig_h = video_info['height']
+        fps = video_info['fps']
+
+        # Output video is 2x width, 2x height (4 panels)
+        out_w = orig_w * 2
+        out_h = orig_h * 2
+
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
+
+        # Re-open original video
+        cap = cv2.VideoCapture(original_video_path)
+
+        print(f"\nCreating 4-panel annotated video...")
+        print(f"Output: {output_path}")
+
+        # ── Estimate water plane from world landmarks ──
+        # The water surface is approximated as the median y-coordinate
+        # of all body landmarks across all detected frames.
+        all_y = []
+        for fn in frame_numbers:
+            p = pose_lookup[fn]
+            if p is not None and p.get('world_landmarks'):
+                wld = p['world_landmarks']
+                for name in ['nose', 'left_shoulder', 'right_shoulder',
+                             'left_elbow', 'right_elbow',
+                             'left_wrist', 'right_wrist',
+                             'left_hip', 'right_hip',
+                             'left_knee', 'right_knee',
+                             'left_ankle', 'right_ankle']:
+                    lm = wld.get(name)
+                    if lm:
+                        all_y.append(lm['y'])
+        water_y = np.median(all_y) if all_y else 0.0
+        print(f"Estimated water surface y = {water_y:.4f} (from {len(all_y)} landmarks)")
+
+        # Seek to first frame with pose data
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min_frame)
+        frame_idx = min_frame
+        rendered_count = 0
+        last_pose = pose_lookup[min_frame]
+
+        # ── 3D landmark names for skeleton connections ──
+        landmark_names = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+                          'left_shoulder', 'right_shoulder',
+                          'left_elbow', 'right_elbow',
+                          'left_wrist', 'right_wrist',
+                          'left_hip', 'right_hip',
+                          'left_knee', 'right_knee',
+                          'left_ankle', 'right_ankle']
+        # Swimming-relevant 3D connections (same as _swim_connections but using names)
+        swim_connections_3d = [
+            ('left_shoulder', 'right_shoulder'),
+            ('left_shoulder', 'left_hip'),
+            ('right_shoulder', 'right_hip'),
+            ('left_hip', 'right_hip'),
+            ('left_shoulder', 'left_elbow'),
+            ('left_elbow', 'left_wrist'),
+            ('right_shoulder', 'right_elbow'),
+            ('right_elbow', 'right_wrist'),
+            ('left_hip', 'left_knee'),
+            ('left_knee', 'left_ankle'),
+            ('right_hip', 'right_knee'),
+            ('right_knee', 'right_ankle'),
+        ]
+
+        while frame_idx <= max_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Get pose
+            if frame_idx in pose_lookup:
+                last_pose = pose_lookup[frame_idx]
+            pose = last_pose
+
+            # ── Build 4-panel canvas ──
+            # Top-left: original analyzed frame
+            tl_panel = frame.copy()
+            if pose is not None:
+                tl_panel = self._draw_pose(tl_panel, pose)
+                tl_panel = self._draw_metrics_overlay(tl_panel, pose, analysis_results)
+            tl_panel = self._draw_stats_panel(tl_panel, pose, analysis_results, frame_idx, max_frame - min_frame + 1)
+
+            panel_w = orig_w
+            panel_h = orig_h
+
+            # ── 3D views (side, top, front) using world landmarks ──
+            # MediaPipe provides world_landmarks in a consistent 3D space (metres):
+            #   x: left-right (horizontal position)
+            #   y: up-down (vertical position, negative = up)
+            #   z: forward-backward (depth, negative = forward toward camera)
+            #
+            # The three views project onto different planes:
+            #   SIDE  (x-y plane)  — same perspective as the camera
+            #   TOP   (x-z plane)  — looking down from above
+            #   FRONT (z-y plane)  — looking from the front
+            if pose is not None and pose.get('world_landmarks'):
+                wld = pose['world_landmarks']
+                pts = {}
+                for name in ['nose', 'left_shoulder', 'right_shoulder',
+                             'left_elbow', 'right_elbow',
+                             'left_wrist', 'right_wrist',
+                             'left_hip', 'right_hip',
+                             'left_knee', 'right_knee',
+                             'left_ankle', 'right_ankle']:
+                    lm = wld.get(name)
+                    if lm:
+                        pts[name] = lm
+
+                if pts:
+                    # Centroid in world space
+                    cx = sum(p['x'] for p in pts.values()) / len(pts)
+                    cy = sum(p['y'] for p in pts.values()) / len(pts)
+                    cz = sum(p['z'] for p in pts.values()) / len(pts)
+
+                    # Bounding box extents (metres)
+                    xs = [p['x'] for p in pts.values()]
+                    ys = [p['y'] for p in pts.values()]
+                    zs = [p['z'] for p in pts.values()]
+                    sx = max(xs) - min(xs)  # body width
+                    sy = max(ys) - min(ys)  # body height
+                    sz = max(zs) - min(zs)  # body depth
+
+                    # Scale so the larger dimension fills ~90% of the panel
+                    scale_side  = min(panel_w / (sx + 0.001), panel_h / (sy + 0.001)) * 0.9
+                    scale_top   = min(panel_w / (sx + 0.001), panel_h / (sz + 0.001)) * 0.9
+                    scale_front = min(panel_w / (sz + 0.001), panel_h / (sy + 0.001)) * 0.9
+
+                    # Helper to draw a skeleton view
+                    def draw_skel(canvas, pts, connections, proj_fn,
+                                  panel_w, panel_h):
+                        """Project each connection and draw line+circle in skeleton colour."""
+                        for src, dst in connections:
+                            if src in pts and dst in pts:
+                                p1 = pts[src]
+                                p2 = pts[dst]
+                                x1, y1 = proj_fn(p1)
+                                x2, y2 = proj_fn(p2)
+                                px1 = int(panel_w // 2 + x1)
+                                py1 = int(panel_h // 2 + y1)
+                                px2 = int(panel_w // 2 + x2)
+                                py2 = int(panel_h // 2 + y2)
+                                cv2.line(canvas, (px1, py1), (px2, py2),
+                                         self.COLOR_SKELETON, 3)
+                                cv2.circle(canvas, (px1, py1), 5,
+                                           self.COLOR_SKELETON, -1)
+                                cv2.circle(canvas, (px2, py2), 5,
+                                           self.COLOR_SKELETON, -1)
+
+                    # ── SIDE VIEW (x-y plane) — same perspective as camera ──
+                    tr_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    tr_panel.fill(255)
+                    draw_skel(tr_panel, pts, swim_connections_3d,
+                              lambda p: ((p['x'] - cx) * scale_side, (p['y'] - cy) * scale_side),
+                              panel_w, panel_h)
+
+                    # Draw water line in SIDE VIEW (horizontal line at water_y)
+                    water_y_proj = int(panel_h // 2 + (water_y - cy) * scale_side)
+                    water_x_proj_left = int(panel_w // 2 + (min(xs) - cx) * scale_side)
+                    water_x_proj_right = int(panel_w // 2 + (max(xs) - cx) * scale_side)
+                    # Draw dashed blue line for water surface
+                    dash_len = 10
+                    for t in range(0, 100, 2):
+                        x = int(water_x_proj_left + (water_x_proj_right - water_x_proj_left) * t / 100)
+                        if (t // dash_len) % 2 == 0:
+                            tr_panel[water_y_proj, max(0, min(panel_w-1, x)), :] = [255, 128, 0]
+                    # Also draw a more visible solid blue line segment
+                    cv2.line(tr_panel,
+                             (max(0, water_x_proj_left), water_y_proj),
+                             (min(panel_w-1, water_x_proj_right), water_y_proj),
+                             (255, 128, 0), 2)  # light blue
+                    # Label in black for visibility
+                    cv2.putText(tr_panel, 'WATER',
+                                (max(0, water_x_proj_right + 10), water_y_proj + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+                    # ── TOP VIEW (x-z plane) — looking down from above ──
+                    bl_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    bl_panel.fill(255)
+                    draw_skel(bl_panel, pts, swim_connections_3d,
+                              lambda p: ((p['x'] - cx) * scale_top, -(p['z'] - cz) * scale_top),
+                              panel_w, panel_h)
+
+                    # ── FRONT VIEW (z-y plane) — looking from the front ──
+                    br_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    br_panel.fill(255)
+                    draw_skel(br_panel, pts, swim_connections_3d,
+                              lambda p: ((p['z'] - cz) * scale_front, (p['y'] - cy) * scale_front),
+                              panel_w, panel_h)
+
+                    # Draw water line in FRONT VIEW (horizontal line at water_y)
+                    water_y_proj_f = int(panel_h // 2 + (water_y - cy) * scale_front)
+                    water_z_proj_top = int(panel_w // 2 + (max(zs) - cz) * scale_front)
+                    water_z_proj_bottom = int(panel_w // 2 + (min(zs) - cz) * scale_front)
+                    cv2.line(br_panel,
+                             (max(0, water_z_proj_top), water_y_proj_f),
+                             (min(panel_w-1, water_z_proj_bottom), water_y_proj_f),
+                             (255, 128, 0), 2)
+                    cv2.putText(br_panel, 'WATER',
+                                (max(0, water_z_proj_bottom + 10), water_y_proj_f + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+                    # ── Panel labels ──
+                    label_font = cv2.FONT_HERSHEY_SIMPLEX
+                    label_scale = 0.8
+                    label_thick = 2
+                    cv2.putText(tr_panel, 'SIDE VIEW', (12, 30),
+                                label_font, label_scale, (0, 0, 0), label_thick)
+                    cv2.putText(bl_panel, 'TOP VIEW', (12, 30),
+                                label_font, label_scale, (0, 0, 0), label_thick)
+                    cv2.putText(br_panel, 'FRONT VIEW', (12, 30),
+                                label_font, label_scale, (0, 0, 0), label_thick)
+                else:
+                    tr_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                    tr_panel.fill(255)
+                    bl_panel = tr_panel.copy()
+                    br_panel = tr_panel.copy()
+            else:
+                tr_panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+                tr_panel.fill(255)
+                bl_panel = tr_panel.copy()
+                br_panel = tr_panel.copy()
+
+            # ── Assemble 4-panel canvas ──
+            canvas4 = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+            canvas4[:orig_h, :orig_w] = tl_panel
+            canvas4[:orig_h, orig_w:] = tr_panel
+            canvas4[orig_h:, :orig_w] = bl_panel
+            canvas4[orig_h:, orig_w:] = br_panel
+
+            writer.write(canvas4)
+            rendered_count += 1
+            frame_idx += 1
+
+            if rendered_count % 30 == 0:
+                print(f"Rendered {rendered_count}/{max_frame - min_frame + 1} frames")
 
         cap.release()
         writer.release()
@@ -159,9 +472,21 @@ class Visualizer:
         For butterfly, both arms are highlighted with a different colour to
         emphasise simultaneous motion.  An entry-width line is drawn between
         the two wrists when both are visible.
+
+        Interpolated poses (where pose detection failed) are drawn in grey
+        to indicate they are estimations.
         """
         landmarks = pose.get('landmarks', {})
         VIS_THRESH = 0.3  # minimum visibility (lowered to accommodate precision-mode penalties)
+
+        # Use grey color for interpolated poses
+        is_interpolated = pose.get('interpolated', False)
+        if is_interpolated:
+            SKELETON_COLOR = (128, 128, 128)  # grey
+            BOTH_ARMS_COLOR = (128, 128, 128)  # grey
+        else:
+            SKELETON_COLOR = self.COLOR_SKELETON
+            BOTH_ARMS_COLOR = self.COLOR_BOTH_ARMS
 
         # ── Native MediaPipe skeleton (standard mode) ──
         if pose.get('raw_landmarks') is not None:
@@ -203,13 +528,13 @@ class Visualizer:
                     dst_lm.get('visibility', 0) >= VIS_THRESH):
                     x1, y1 = int(src_lm['x']), int(src_lm['y'])
                     x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
-                    cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_SKELETON, 2)
+                    cv2.line(frame, (x1, y1), (x2, y2), SKELETON_COLOR, 2)
             # Draw landmark dots
             for name in name_to_idx:
                 lm = landmarks.get(name)
                 if lm and lm.get('visibility', 0) >= VIS_THRESH:
                     x, y = int(lm['x']), int(lm['y'])
-                    cv2.circle(frame, (x, y), 4, self.COLOR_SKELETON, -1)
+                    cv2.circle(frame, (x, y), 4, SKELETON_COLOR, -1)
 
         # ── Butterfly-specific overlays ──
         if self._is_backstroke:
@@ -229,9 +554,9 @@ class Visualizer:
                     dst_lm.get('visibility', 0) > 0.3):
                     x1, y1 = int(src_lm['x']), int(src_lm['y'])
                     x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
-                    cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 3)
-                    cv2.circle(frame, (x1, y1), 5, self.COLOR_BOTH_ARMS, -1)
-                    cv2.circle(frame, (x2, y2), 5, self.COLOR_BOTH_ARMS, -1)
+                    cv2.line(frame, (x1, y1), (x2, y2), BOTH_ARMS_COLOR, 3)
+                    cv2.circle(frame, (x1, y1), 5, BOTH_ARMS_COLOR, -1)
+                    cv2.circle(frame, (x2, y2), 5, BOTH_ARMS_COLOR, -1)
             return frame
 
         if not self._is_butterfly:
@@ -252,9 +577,9 @@ class Visualizer:
                 dst_lm.get('visibility', 0) > 0.3):
                 x1, y1 = int(src_lm['x']), int(src_lm['y'])
                 x2, y2 = int(dst_lm['x']), int(dst_lm['y'])
-                cv2.line(frame, (x1, y1), (x2, y2), self.COLOR_BOTH_ARMS, 4)
-                cv2.circle(frame, (x1, y1), 6, self.COLOR_BOTH_ARMS, -1)
-                cv2.circle(frame, (x2, y2), 6, self.COLOR_BOTH_ARMS, -1)
+                cv2.line(frame, (x1, y1), (x2, y2), BOTH_ARMS_COLOR, 4)
+                cv2.circle(frame, (x1, y1), 6, BOTH_ARMS_COLOR, -1)
+                cv2.circle(frame, (x2, y2), 6, BOTH_ARMS_COLOR, -1)
 
         # 2. Entry-width line between wrists (magenta)
         left_wrist = landmarks.get('left_wrist')
@@ -302,7 +627,11 @@ class Visualizer:
 
         For butterfly: both elbow angles are shown, plus a sync indicator
         between the two wrists.
+
+        Skips overlay for interpolated poses (no reliable live metrics).
         """
+        if pose.get('interpolated', False):
+            return frame
         landmarks = pose['landmarks']
         metrics = analysis['metrics']
         is_bf = self._is_butterfly

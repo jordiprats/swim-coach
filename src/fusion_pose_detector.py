@@ -207,8 +207,14 @@ class FusionPoseDetector:
         else:
             return None
 
+        # Include world_landmarks from MediaPipe (3D space in metres)
+        world_landmarks = {}
+        if mp_result is not None and 'world_landmarks' in mp_result:
+            world_landmarks = mp_result['world_landmarks']
+
         return {
             'landmarks': fused_landmarks,
+            'world_landmarks': world_landmarks,
             'raw_landmarks': None,
             'frame_shape': (h, w),
         }

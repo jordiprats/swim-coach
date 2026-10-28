@@ -26,7 +26,7 @@ from src.stroke_config import StrokeConfig, CONFIGS, SHARED_METRICS
 
 # ── Shared thresholds (tuneable) ──
 MIN_VISIBILITY = 0.3
-BONE_LENGTH_TOLERANCE = 0.25
+BONE_LENGTH_TOLERANCE = 0.5
 HAMPEL_WINDOW = 5
 HAMPEL_NSIGMA = 3
 SAVITZKY_GOLAY_WINDOW = 7                     # odd, ~0.3 s at 30 fps
@@ -175,7 +175,31 @@ class BaseAnalyzer(ABC):
         self._camera_view = self._detect_camera_view(valid_frames)
         print(f"Camera view: {self._camera_view}")
 
-        # 2. Direction canonicalization (flip so swimmer heads right)
+        # 2. Video quality pre-check
+        shoulder_span = None
+        for f in valid_frames[:50]:
+            lm = f['pose']['landmarks']
+            ls = lm.get('left_shoulder')
+            rs = lm.get('right_shoulder')
+            if ls and rs and ls['visibility'] >= MIN_VISIBILITY and rs['visibility'] >= MIN_VISIBILITY:
+                span = abs(ls['x'] - rs['x'])
+                frame_shape = f.get('frame_shape', f.get('pose', {}).get('frame_shape'))
+                if isinstance(frame_shape, (list, tuple)) and len(frame_shape) >= 2:
+                    img_w = frame_shape[1]
+                else:
+                    img_w = 1
+                if span > 0 and img_w > 0:
+                    shoulder_span = span / img_w
+                    break
+        if shoulder_span is not None and shoulder_span < 0.05:
+            print(f'  ⚠️ Swimmer very small in frame ({shoulder_span*100:.1f}% of width).')
+            print(f'  Consider cropping the video closer to the swimmer for better pose detection.')
+        elif shoulder_span is None:
+            print(f'  ⚠️ Could not measure swimmer size — pose detection may be poor.')
+        else:
+            print(f'  Swimmer occupies {shoulder_span*100:.1f}% of frame width.')
+
+        # 3. Direction canonicalization (flip so swimmer heads right)
         canonical = self._canonicalize_direction(valid_frames)
 
         # 3. Torso-length normalisation (all modes)
@@ -187,6 +211,9 @@ class BaseAnalyzer(ABC):
 
         # 5. Savitzky–Golay smoothing on landmark coordinates
         smoothed = self._smooth_landmarks(clean)
+
+        # 5b. Extra temporal smoothing for hip/knee landmarks (most prone to tracker confusion)
+        smoothed = self._smooth_hip_knee(smoothed)
 
         # 6. Active swimming filter
         active = self._filter_active_swimming_frames(smoothed)
@@ -242,6 +269,179 @@ class BaseAnalyzer(ABC):
     # ── Shared pipeline steps ──
 
     @staticmethod
+    def _interpolate_missing_frames(pose_data: List[Dict], video_path: str = None) -> List[Dict]:
+        """Fill in frames where pose detection failed (pose is None) by
+        interpolating all landmarks from neighbouring valid frames using
+        cubic Hermite splines.
+
+        Interpolated landmarks are tagged with 'interpolated': True so the
+        visualizer can render them in grey.
+
+        If video_path is provided, for each missing frame the actual video
+        frame is read and the swimmer's position is detected using a simple
+        MediaPipe call with low confidence.  The detected position is used
+        to shift the interpolated landmarks so the skeleton follows the
+        swimmer rather than drifting.
+        """
+        import copy
+        result = copy.deepcopy(pose_data)
+
+        # ── Helper: detect swimmer nose in a video frame ──
+        def _detect_nose_in_frame(video_path: str, frame_idx: int):
+            """Read a specific frame from the video and run MediaPipe pose
+            detection at low confidence.  Returns (x, y) of nose or None."""
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                cap.release()
+                if not ret:
+                    return None
+                import mediapipe as mp
+                mp_pose = mp.solutions.pose.Pose(
+                    static_image_mode=True,
+                    model_complexity=1,
+                    min_detection_confidence=0.3,
+                )
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = mp_pose.process(rgb)
+                mp_pose.close()
+                if results.pose_landmarks:
+                    nose = results.pose_landmarks.landmark[0]
+                    h, w = frame.shape[:2]
+                    return (nose.x * w, nose.y * h)
+                return None
+            except Exception:
+                return None
+
+        # Find segments of consecutive missing frames
+        missing_segments = []
+        in_missing = False
+        seg_start = 0
+        for i, f in enumerate(result):
+            if f['pose'] is None and not in_missing:
+                seg_start = i
+                in_missing = True
+            elif f['pose'] is not None and in_missing:
+                missing_segments.append((seg_start, i - 1))
+                in_missing = False
+        if in_missing:
+            missing_segments.append((seg_start, len(result) - 1))
+
+        if not missing_segments:
+            return result
+
+        # Collect all landmark keys from a valid frame
+        landmark_keys = None
+        for f in result:
+            if f['pose'] is not None:
+                landmark_keys = list(f['pose']['landmarks'].keys())
+                break
+        if not landmark_keys:
+            return result
+
+        for seg_start, seg_end in missing_segments:
+            pre_idx = seg_start - 1
+            while pre_idx >= 0 and result[pre_idx]['pose'] is None:
+                pre_idx -= 1
+            if pre_idx < 0:
+                continue
+            post_idx = seg_end + 1
+            while post_idx < len(result) and result[post_idx]['pose'] is None:
+                post_idx += 1
+            if post_idx >= len(result):
+                continue
+
+            pre_frame = result[pre_idx]
+            post_frame = result[post_idx]
+            total_gap = post_idx - pre_idx
+            seg_len = seg_end - seg_start + 1
+
+            for k in landmark_keys:
+                pre_lm = pre_frame['pose']['landmarks'].get(k)
+                post_lm = post_frame['pose']['landmarks'].get(k)
+                if pre_lm is None or post_lm is None:
+                    continue
+
+                if seg_len < 3:
+                    # Linear interpolation for very short segments
+                    for j in range(seg_start, seg_end + 1):
+                        t = (j - pre_idx) / total_gap
+                        if result[j]['pose'] is None:
+                            result[j]['pose'] = {'landmarks': {}, 'interpolated': True}
+                        lm = result[j]['pose']['landmarks']
+                        lm[k] = {
+                            'x': pre_lm['x'] * (1 - t) + post_lm['x'] * t,
+                            'y': pre_lm['y'] * (1 - t) + post_lm['y'] * t,
+                            'z': pre_lm['z'] * (1 - t) + post_lm['z'] * t,
+                            'visibility': 0.3,
+                            'interpolated': True,
+                        }
+                else:
+                    # Cubic Hermite spline
+                    pre2_idx = max(0, pre_idx - 1)
+                    if pre2_idx != pre_idx:
+                        pre2_frame = result[pre2_idx]
+                        if pre2_frame['pose'] is not None and k in pre2_frame['pose']['landmarks']:
+                            pre2_lm = pre2_frame['pose']['landmarks'][k]
+                            dt_pre = pre_idx - pre2_idx
+                            m_pre_x = (pre_lm['x'] - pre2_lm['x']) / dt_pre
+                            m_pre_y = (pre_lm['y'] - pre2_lm['y']) / dt_pre
+                            m_pre_z = (pre_lm['z'] - pre2_lm['z']) / dt_pre
+                        else:
+                            m_pre_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                            m_pre_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                            m_pre_z = (post_lm['z'] - pre_lm['z']) / total_gap
+                    else:
+                        m_pre_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                        m_pre_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                        m_pre_z = (post_lm['z'] - pre_lm['z']) / total_gap
+
+                    post2_idx = min(len(result) - 1, post_idx + 1)
+                    if post2_idx != post_idx:
+                        post2_frame = result[post2_idx]
+                        if post2_frame['pose'] is not None and k in post2_frame['pose']['landmarks']:
+                            post2_lm = post2_frame['pose']['landmarks'][k]
+                            dt_post = post2_idx - post_idx
+                            m_post_x = (post2_lm['x'] - post_lm['x']) / dt_post
+                            m_post_y = (post2_lm['y'] - post_lm['y']) / dt_post
+                            m_post_z = (post2_lm['z'] - post_lm['z']) / dt_post
+                        else:
+                            m_post_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                            m_post_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                            m_post_z = (post_lm['z'] - pre_lm['z']) / total_gap
+                    else:
+                        m_post_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                        m_post_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                        m_post_z = (post_lm['z'] - pre_lm['z']) / total_gap
+
+                    for j in range(seg_start, seg_end + 1):
+                        t = (j - pre_idx) / total_gap
+                        h00 = 1 - 3*t*t + 2*t*t*t
+                        h10 = t - 2*t*t + t*t*t
+                        h01 = -t*t + 2*t*t*t
+                        h11 = -t*t + t*t*t
+                        if result[j]['pose'] is None:
+                            result[j]['pose'] = {'landmarks': {}, 'interpolated': True}
+                        lm = result[j]['pose']['landmarks']
+                        lm[k] = {
+                            'x': h00 * pre_lm['x'] + h10 * m_pre_x * total_gap + h01 * post_lm['x'] + h11 * m_post_x * total_gap,
+                            'y': h00 * pre_lm['y'] + h10 * m_pre_y * total_gap + h01 * post_lm['y'] + h11 * m_post_y * total_gap,
+                            'z': h00 * pre_lm['z'] + h10 * m_pre_z * total_gap + h01 * post_lm['z'] + h11 * m_post_z * total_gap,
+                            'visibility': 0.3,
+                            'interpolated': True,
+                        }
+
+        # ── Drift correction disabled ──
+        # The video-frame detection approach introduced false detections
+        # (MediaPipe detecting a pose in the water). Simple interpolation
+        # between neighbouring frames is more reliable. The grey skeleton
+        # may be slightly off but won't jump to a wrong position.
+
+        return result
+
+    @staticmethod
     def _detect_camera_view(frames: List[Dict]) -> str:
         """Detect side-view vs overhead from shoulder-separation ratio."""
         ratios = []
@@ -265,35 +465,65 @@ class BaseAnalyzer(ABC):
 
     @staticmethod
     def _canonicalize_direction(frames: List[Dict]) -> List[Dict]:
-        """Flip x-coordinates so swimmer always heads right."""
+        """Flip x-coordinates so swimmer always heads right.
+
+        Uses the image width from the frame's frame_shape to compute
+        the correct pixel-space flip: x' = image_width - x.
+
+        Handles direction changes mid-video: each frame is flipped
+        independently based on its own nose/hip direction. Frames where
+        the direction cannot be determined (missing landmarks) are
+        left unchanged.
+        """
         if not frames:
             return frames
+
+        # Get image width (use the first available frame_shape)
+        img_w = None
         for f in frames:
-            landmarks = f['pose']['landmarks']
+            fs = f.get('frame_shape') or (f.get('pose') or {}).get('frame_shape')
+            if fs and len(fs) >= 2:
+                img_w = fs[1]
+                break
+        if img_w is None:
+            img_w = 1  # fallback, will not flip meaningfully
+
+        flipped = []
+        for f2 in frames:
+            landmarks = f2['pose']['landmarks']
             nose = landmarks.get('nose')
             lh = landmarks.get('left_hip')
             rh = landmarks.get('right_hip')
+            needs_flip = False
             if (nose and lh and rh and
                 nose['visibility'] >= MIN_VISIBILITY and
                 lh['visibility'] >= MIN_VISIBILITY):
                 hip_x = (lh['x'] + rh['x']) / 2
-                if nose['x'] < hip_x:
-                    return frames
-                flipped = []
-                for f2 in frames:
-                    lm = f2['pose']['landmarks'].copy()
-                    for k in lm:
-                        lm[k] = lm[k].copy()
-                        lm[k]['x'] = 1.0 - lm[k]['x']
-                    flipped.append(f2.copy())
-                    flipped[-1]['pose'] = f2['pose'].copy()
-                    flipped[-1]['pose']['landmarks'] = lm
-                return flipped
-        return frames
+                # nose right of hips → heading left → flip so nose left of hips
+                if nose['x'] >= hip_x:
+                    needs_flip = True
+
+            if needs_flip:
+                lm = landmarks.copy()
+                for k in lm:
+                    lm[k] = lm[k].copy()
+                    lm[k]['x'] = img_w - lm[k]['x']
+                flipped.append(f2.copy())
+                flipped[-1]['pose'] = f2['pose'].copy()
+                flipped[-1]['pose']['landmarks'] = lm
+            else:
+                flipped.append(f2.copy())
+
+        return flipped
 
     @staticmethod
     def _compute_torso_lengths(frames: List[Dict]) -> List[Optional[float]]:
-        """Torso length per frame (shoulder_mid → hip_mid vertical)."""
+        """Torso length per frame (shoulder_mid → hip_mid vertical).
+
+        Rejects frames where torso length < MIN_TORSO_LENGTH (10 px) to avoid
+        normalization explosion when the tracker misplaces the shoulder or hip.
+        """
+        MIN_TORSO_LENGTH = 10.0
         lengths = []
         for f in frames:
             landmarks = f['pose']['landmarks']
@@ -304,7 +534,11 @@ class BaseAnalyzer(ABC):
             if (ls and rs and lh and rh and
                 ls['visibility'] >= MIN_VISIBILITY and rs['visibility'] >= MIN_VISIBILITY and
                 lh['visibility'] >= MIN_VISIBILITY and rh['visibility'] >= MIN_VISIBILITY):
-                lengths.append(abs((ls['y'] + rs['y']) / 2 - (lh['y'] + rh['y']) / 2))
+                tl = abs((ls['y'] + rs['y']) / 2 - (lh['y'] + rh['y']) / 2)
+                if tl >= MIN_TORSO_LENGTH:
+                    lengths.append(tl)
+                else:
+                    lengths.append(None)
             else:
                 lengths.append(None)
         # EMA smoothing
@@ -323,13 +557,19 @@ class BaseAnalyzer(ABC):
 
     @staticmethod
     def _normalize_to_torso(frames: List[Dict], torso_lengths: List[float]) -> List[Dict]:
-        """Scale y-coordinates by 1/torso_length.  Returns new frame dicts."""
+        """Scale y-coordinates by 1/median_torso_length.  Uses the median torso
+        length across all valid frames instead of per-frame values, avoiding
+        normalization explosion when the tracker misplaces the shoulder or hip.
+
+        Returns new frame dicts.
+        """
+        valid_tl = [v for v in torso_lengths if v is not None and v > 0]
+        if not valid_tl:
+            return frames
+        median_tl = np.median(valid_tl)
+        scale = 1.0 / median_tl
         result = []
-        for f, tl in zip(frames, torso_lengths):
-            if tl is None or tl <= 0:
-                result.append(f)
-                continue
-            scale = 1.0 / tl
+        for f in frames:
             lm = f['pose']['landmarks'].copy()
             for k in lm:
                 lm[k] = lm[k].copy()
@@ -382,6 +622,9 @@ class BaseAnalyzer(ABC):
                     ok = False
             if ok:
                 good.append(f)
+        # If we would reject more than 50% of frames, fall back to all frames
+        if len(good) < len(frames) * 0.5:
+            return frames
         return good
 
     @staticmethod
@@ -437,38 +680,105 @@ class BaseAnalyzer(ABC):
             result[-1]['pose']['landmarks'] = lm
         return result
 
-    @staticmethod
-    def _filter_active_swimming_frames(frames: List[Dict]) -> List[Dict]:
-        """Filter non-swimming frames using orientation + confidence + periodicity."""
+    def _smooth_hip_knee(self, frames: List[Dict]) -> List[Dict]:
+        """Apply a centred moving average specifically to hip and knee
+        landmarks, which are most prone to tracker confusion (e.g., splash
+        or body rotation causing sudden jumps).  Uses a wider window than
+        the Savitzky–Golay pass (11 frames ~ 0.37 s at 30 fps)."""
+        import copy
+        result = copy.deepcopy(frames)
+        n = len(frames)
+        if n < 11:
+            return result
+
+        hip_knee_keys = [
+            'left_hip', 'right_hip',
+            'left_knee', 'right_knee',
+        ]
+        window = 11
+        half = window // 2
+
+        for k in hip_knee_keys:
+            xs = [result[i]['pose']['landmarks'][k]['x'] for i in range(n)]
+            ys = [result[i]['pose']['landmarks'][k]['y'] for i in range(n)]
+            # Replace Nones with interpolated values for smoothing
+            valid_x = [(i, v) for i, v in enumerate(xs) if v is not None]
+            valid_y = [(i, v) for i, v in enumerate(ys) if v is not None]
+            if len(valid_x) < window or len(valid_y) < window:
+                continue
+            # Linear interpolation for missing values
+            xs_interp = xs[:]
+            ys_interp = ys[:]
+            for i in range(n):
+                if xs_interp[i] is None:
+                    before = [(j, v) for j, v in valid_x if j < i]
+                    after = [(j, v) for j, v in valid_x if j > i]
+                    if before and after:
+                        b, a = before[-1], after[0]
+                        t = (i - b[0]) / (a[0] - b[0])
+                        xs_interp[i] = b[1] + t * (a[1] - b[1])
+                    elif before:
+                        xs_interp[i] = before[-1][1]
+                    elif after:
+                        xs_interp[i] = after[0][1]
+                if ys_interp[i] is None:
+                    before = [(j, v) for j, v in valid_y if j < i]
+                    after = [(j, v) for j, v in valid_y if j > i]
+                    if before and after:
+                        b, a = before[-1], after[0]
+                        t = (i - b[0]) / (a[0] - b[0])
+                        ys_interp[i] = b[1] + t * (a[1] - b[1])
+                    elif before:
+                        ys_interp[i] = before[-1][1]
+                    elif after:
+                        ys_interp[i] = after[0][1]
+            # Centred moving average
+            smoothed_x = []
+            smoothed_y = []
+            for i in range(n):
+                lo = max(0, i - half)
+                hi = min(n, i + half + 1)
+                smoothed_x.append(sum(xs_interp[lo:hi]) / (hi - lo))
+                smoothed_y.append(sum(ys_interp[lo:hi]) / (hi - lo))
+            # Write back, keeping original Nones for missing landmarks
+            for i in range(n):
+                if xs[i] is not None:
+                    result[i]['pose']['landmarks'][k]['x'] = smoothed_x[i]
+                if ys[i] is not None:
+                    result[i]['pose']['landmarks'][k]['y'] = smoothed_y[i]
+
+        return result
+
+    def _filter_active_swimming_frames(self, frames: List[Dict]) -> List[Dict]:
+        """Filter non-swimming frames using wrist_x range over a sliding window.
+
+        During swimming the arms move widely; during preparation/waiting the
+        wrist_x is relatively stable.  Frames with wrist_x range < threshold
+        over a 1-second window are marked as inactive and excluded.
+
+        Uses whichever wrist is visible, with a relative threshold based on
+        frame width.
+        """
         if len(frames) < 10:
             return frames
-        orientations = []
-        confidences = []
-        for f in frames:
-            landmarks = f['pose']['landmarks']
-            ls = landmarks.get('left_shoulder')
-            rs = landmarks.get('right_shoulder')
-            lh = landmarks.get('left_hip')
-            rh = landmarks.get('right_hip')
-            if (ls and rs and lh and rh and
-                ls['visibility'] >= MIN_VISIBILITY and rs['visibility'] >= MIN_VISIBILITY and
-                lh['visibility'] >= MIN_VISIBILITY and rh['visibility'] >= MIN_VISIBILITY):
-                sx = (ls['x'] + rs['x']) / 2
-                sy = (ls['y'] + rs['y']) / 2
-                hx = (lh['x'] + rh['x']) / 2
-                hy = (lh['y'] + rh['y']) / 2
-                angle = abs(math.degrees(math.atan2(hy - sy, hx - sx)))
-                orientations.append(angle)
-            else:
-                orientations.append(None)
-            vis = [landmarks.get(k, {}).get('visibility', 0)
-                   for k in ['nose', 'left_shoulder', 'right_shoulder', 'left_hip', 'right_hip']]
-            confidences.append(np.mean(vis) if vis else 0)
 
-        # Wrist-x periodicity via autocorrelation
+        # Determine frame width from first frame (x range of shoulders)
+        first = frames[0]['pose']['landmarks']
+        ls = first.get('left_shoulder')
+        rs = first.get('right_shoulder')
+        if ls and rs:
+            frame_width = abs(ls['x'] - rs['x']) * 4  # rough frame width estimate
+        else:
+            frame_width = 1000  # fallback
+
+        RELATIVE_THRESHOLD = 0.05  # 5% of frame width (more permissive)
+        ACTIVE_THRESHOLD = max(30, frame_width * RELATIVE_THRESHOLD)
+        WINDOW = 15  # ~0.5 second at 30 fps (half the old window)
+
+        # Compute wrist_x for each frame using whichever wrist is visible
         wrist_x = []
-        for f in frames:
-            landmarks = f['pose']['landmarks']
+        for frame in frames:
+            landmarks = frame['pose']['landmarks']
             lw = landmarks.get('left_wrist')
             rw = landmarks.get('right_wrist')
             if lw and lw['visibility'] >= MIN_VISIBILITY:
@@ -477,50 +787,27 @@ class BaseAnalyzer(ABC):
                 wrist_x.append(rw['x'])
             else:
                 wrist_x.append(None)
-        valid_x = [v for v in wrist_x if v is not None]
-        periodicity = 0
-        if len(valid_x) > 20:
-            mean_x = np.mean(valid_x)
-            centered = [v - mean_x for v in valid_x]
-            acorr = np.correlate(centered, centered, mode='full')
-            mid = len(acorr) // 2
-            left = acorr[mid + 1: mid + len(valid_x) // 2]
-            if len(left) > 0:
-                periodicity = np.max(left) / acorr[mid] if acorr[mid] > 0 else 0
 
-        swimming = []
-        for angle, conf in zip(orientations, confidences):
-            if angle is not None and angle < 40 and conf > 0.5:
-                swimming.append(True)
-            else:
-                swimming.append(False)
+        # Determine active status for each frame
+        active_flags = [False] * len(frames)
+        for i in range(len(frames)):
+            half = WINDOW // 2
+            lo = max(0, i - half)
+            hi = min(len(frames), i + half + 1)
+            window_values = [wx for wx in wrist_x[lo:hi] if wx is not None]
+            # Require at least 5 valid values in window (relaxed)
+            if len(window_values) >= 5:
+                w_range = max(window_values) - min(window_values)
+                active_flags[i] = w_range >= ACTIVE_THRESHOLD
 
-        if periodicity > 0.3 and sum(swimming) < len(frames) * 0.3:
-            for i in range(len(swimming)):
-                if orientations[i] is not None and orientations[i] < 60 and confidences[i] > 0.4:
-                    swimming[i] = True
+        # Return only active frames
+        active = [frames[i] for i in range(len(frames)) if active_flags[i]]
 
-        # Turn detection (direction reversal)
-        nose_x = []
-        hip_x = []
-        for f in frames:
-            landmarks = f['pose']['landmarks']
-            n = landmarks.get('nose')
-            lh = landmarks.get('left_hip')
-            rh = landmarks.get('right_hip')
-            if n and lh and rh and n['visibility'] >= MIN_VISIBILITY:
-                nose_x.append(n['x'])
-                hip_x.append((lh['x'] + rh['x']) / 2)
-            else:
-                nose_x.append(None)
-                hip_x.append(None)
-        for i in range(1, len(nose_x)):
-            if nose_x[i] is not None and nose_x[i-1] is not None and hip_x[i] is not None:
-                if (nose_x[i-1] - hip_x[i]) * (nose_x[i] - hip_x[i]) < 0:
-                    for j in range(max(0, i - 5), min(len(swimming), i + 5)):
-                        swimming[j] = False
+        if len(active) < max(10, len(frames) * 0.3):
+            # Fall back to all frames if too few are active
+            return frames
 
-        return [f for i, f in enumerate(frames) if swimming[i]]
+        return active
 
     @staticmethod
     def _detect_arm_labels(frames: List[Dict]) -> Dict:
@@ -575,6 +862,9 @@ class BaseAnalyzer(ABC):
         # ── Recovery height ──
         results['recovery_height'] = self._metric_recovery_height(frames, torso_lengths)
 
+        # ── Elbow during recovery (air phase) ──
+        results['recovery_elbow'] = self._metric_recovery_elbow(frames, cycles, near_arm)
+
         # ── Breath lift ──
         results['breath_lift'] = self._metric_breath_lift(frames, torso_lengths)
 
@@ -582,26 +872,306 @@ class BaseAnalyzer(ABC):
 
     # ── Individual metric implementations ──
 
+    # ── Air/water phase detection ──
+
+    def _detect_air_water_phases(self, frames: List[Dict]) -> Dict:
+        """Label each frame as 'air' (recovery, hand above water) or 'water'
+        (pull, hand underwater) for both arms.
+
+        Uses:
+          - Wrist visibility (low -> underwater)
+          - Wrist y relative to shoulder y (below shoulder -> underwater)
+          - Temporal smoothing (majority over +/- 3 frames)
+        """
+        near_arm = self._arm_labels.get('near_arm', 'left')
+        far_arm = 'right' if near_arm == 'left' else 'left'
+
+        def _label_arm(arm):
+            labels = []
+            for f in frames:
+                lm = f['pose']['landmarks']
+                sh = lm[f'{arm}_shoulder']
+                wr = lm[f'{arm}_wrist']
+                if wr['visibility'] < 0.3 or wr['y'] > sh['y']:
+                    labels.append('water')
+                else:
+                    labels.append('air')
+            # Smooth: majority vote over +/- 3 frames
+            smoothed = labels[:]
+            for i in range(len(labels)):
+                start = max(0, i - 3)
+                end = min(len(labels), i + 4)
+                window = labels[start:end]
+                air_count = window.count('air')
+                water_count = window.count('water')
+                smoothed[i] = 'air' if air_count >= water_count else 'water'
+            return smoothed
+
+        return {
+            'near_arm_labels': _label_arm(near_arm),
+            'far_arm_labels': _label_arm(far_arm),
+        }
+
+    def _interpolate_underwater_limbs(self, frames: List[Dict], arm: str,
+                                       phase_labels: List[str]) -> List[Dict]:
+        """Return a copy of frames with wrist AND elbow positions interpolated
+        during underwater ('water') segments using kinematic constraints.
+
+        Instead of naive spline interpolation, this method:
+          1. Measures the average upper-arm length (shoulder->elbow) and forearm
+             length (elbow->wrist) from visible frames.
+          2. During underwater segments, interpolates the shoulder trajectory
+             (which should remain visible) using a cubic Hermite spline.
+          3. Uses the measured arm lengths and a simple inverse-kinematics
+             approach to estimate elbow and wrist positions: the limb is scaled
+             to preserve the measured arm lengths while following the smooth
+             trajectory of the Hermite spline.
+
+        This gives physically realistic limb positions even when both the
+        elbow and wrist are invisible underwater, without needing SMPL.
+        """
+        import copy
+        import math
+        result = copy.deepcopy(frames)
+
+        # ---- Measure arm lengths from visible frames ----
+        upper_arm_lengths = []
+        forearm_lengths = []
+        for f in frames:
+            lm = f['pose']['landmarks']
+            sh = lm[f'{arm}_shoulder']
+            el = lm[f'{arm}_elbow']
+            wr = lm[f'{arm}_wrist']
+            if (sh['visibility'] >= MIN_VISIBILITY and
+                el['visibility'] >= MIN_VISIBILITY and
+                wr['visibility'] >= MIN_VISIBILITY):
+                ua = math.sqrt((sh['x'] - el['x'])**2 + (sh['y'] - el['y'])**2)
+                fa = math.sqrt((el['x'] - wr['x'])**2 + (el['y'] - wr['y'])**2)
+                if ua > 0 and fa > 0:
+                    upper_arm_lengths.append(ua)
+                    forearm_lengths.append(fa)
+
+        if not upper_arm_lengths:
+            # Fall back to pure Hermite spline
+            return self._interpolate_underwater_limbs_spline(
+                frames, arm, phase_labels)
+
+        avg_upper_len = np.median(upper_arm_lengths)
+        avg_forearm_len = np.median(forearm_lengths)
+
+        # ---- Find contiguous water segments ----
+        water_segments = []
+        in_water = False
+        seg_start = 0
+        for i, label in enumerate(phase_labels):
+            if label == 'water' and not in_water:
+                seg_start = i
+                in_water = True
+            elif label == 'air' and in_water:
+                water_segments.append((seg_start, i - 1))
+                in_water = False
+        if in_water:
+            water_segments.append((seg_start, len(phase_labels) - 1))
+
+        # ---- Interpolate shoulder via Hermite spline ----
+        shoulder_interpolated = self._interpolate_underwater_limbs_single(
+            result, arm, phase_labels, f'{arm}_shoulder', water_segments)
+
+        # ---- Helper: scale limb to preserve measured lengths ----
+        def _scale_limb(sh_x, sh_y, el_x, el_y, wr_x, wr_y,
+                         target_upper, target_forearm):
+            """Scale elbow and wrist relative to shoulder to match target
+            arm lengths while preserving direction."""
+            ua = math.sqrt((sh_x - el_x)**2 + (sh_y - el_y)**2)
+            if ua > 1e-6:
+                s_upper = target_upper / ua
+                el_x = sh_x + (el_x - sh_x) * s_upper
+                el_y = sh_y + (el_y - sh_y) * s_upper
+            fa = math.sqrt((el_x - wr_x)**2 + (el_y - wr_y)**2)
+            if fa > 1e-6:
+                s_forearm = target_forearm / fa
+                wr_x = el_x + (wr_x - el_x) * s_forearm
+                wr_y = el_y + (wr_y - el_y) * s_forearm
+            return el_x, el_y, wr_x, wr_y
+
+        # ---- Process each water segment ----
+        for seg_start, seg_end in water_segments:
+            pre_idx = seg_start - 1
+            while pre_idx >= 0 and phase_labels[pre_idx] == 'water':
+                pre_idx -= 1
+            if pre_idx < 0:
+                continue
+            post_idx = seg_end + 1
+            while post_idx < len(phase_labels) and phase_labels[post_idx] == 'water':
+                post_idx += 1
+            if post_idx >= len(phase_labels):
+                continue
+
+            total_gap = post_idx - pre_idx
+
+            pre_lms = shoulder_interpolated[pre_idx]['pose']['landmarks']
+            post_lms = shoulder_interpolated[post_idx]['pose']['landmarks']
+            pre_sh = pre_lms[f'{arm}_shoulder']
+            post_sh = post_lms[f'{arm}_shoulder']
+            pre_el = pre_lms[f'{arm}_elbow']
+            post_el = post_lms[f'{arm}_elbow']
+            pre_wr = pre_lms[f'{arm}_wrist']
+            post_wr = post_lms[f'{arm}_wrist']
+
+            for j in range(seg_start, seg_end + 1):
+                t = (j - pre_idx) / total_gap
+                lm = result[j]['pose']['landmarks']
+
+                # Shoulder already interpolated
+                sh = shoulder_interpolated[j]['pose']['landmarks'][f'{arm}_shoulder']
+
+                # Initial guess: linear blend of pre and post
+                el_x = (1-t) * pre_el['x'] + t * post_el['x']
+                el_y = (1-t) * pre_el['y'] + t * post_el['y']
+                wr_x = (1-t) * pre_wr['x'] + t * post_wr['x']
+                wr_y = (1-t) * pre_wr['y'] + t * post_wr['y']
+
+                # Apply IK constraints
+                el_x, el_y, wr_x, wr_y = _scale_limb(
+                    sh['x'], sh['y'], el_x, el_y, wr_x, wr_y,
+                    avg_upper_len, avg_forearm_len)
+
+                lm[f'{arm}_elbow']['x'] = el_x
+                lm[f'{arm}_elbow']['y'] = el_y
+                lm[f'{arm}_elbow']['z'] = (1-t) * pre_el['z'] + t * post_el['z']
+                lm[f'{arm}_elbow']['visibility'] = 0.5
+                lm[f'{arm}_wrist']['x'] = wr_x
+                lm[f'{arm}_wrist']['y'] = wr_y
+                lm[f'{arm}_wrist']['z'] = (1-t) * pre_wr['z'] + t * post_wr['z']
+                lm[f'{arm}_wrist']['visibility'] = 0.5
+
+        return result
+
+    def _interpolate_underwater_limbs_single(
+        self, frames: List[Dict], arm: str, phase_labels: List[str],
+        landmark_key: str, water_segments: List[Tuple[int, int]] = None
+    ) -> List[Dict]:
+        """Interpolate a single landmark across water segments using cubic
+        Hermite spline. Returns a copy of frames with that landmark filled in."""
+        import copy
+        result = copy.deepcopy(frames)
+
+        if water_segments is None:
+            water_segments = []
+            in_water = False
+            seg_start = 0
+            for i, label in enumerate(phase_labels):
+                if label == 'water' and not in_water:
+                    seg_start = i
+                    in_water = True
+                elif label == 'air' and in_water:
+                    water_segments.append((seg_start, i - 1))
+                    in_water = False
+            if in_water:
+                water_segments.append((seg_start, len(phase_labels) - 1))
+
+        for seg_start, seg_end in water_segments:
+            pre_idx = seg_start - 1
+            while pre_idx >= 0 and phase_labels[pre_idx] == 'water':
+                pre_idx -= 1
+            if pre_idx < 0:
+                continue
+            pre_lm = result[pre_idx]['pose']['landmarks'][landmark_key]
+
+            post_idx = seg_end + 1
+            while post_idx < len(phase_labels) and phase_labels[post_idx] == 'water':
+                post_idx += 1
+            if post_idx >= len(phase_labels):
+                continue
+            post_lm = result[post_idx]['pose']['landmarks'][landmark_key]
+
+            total_gap = post_idx - pre_idx
+            seg_len = seg_end - seg_start + 1
+
+            if seg_len < 3:
+                for j in range(seg_start, seg_end + 1):
+                    t = (j - pre_idx) / total_gap
+                    lm = result[j]['pose']['landmarks'][landmark_key]
+                    lm['x'] = pre_lm['x'] * (1 - t) + post_lm['x'] * t
+                    lm['y'] = pre_lm['y'] * (1 - t) + post_lm['y'] * t
+                    lm['z'] = pre_lm['z'] * (1 - t) + post_lm['z'] * t
+                    lm['visibility'] = 0.5
+                continue
+
+            pre2_idx = max(0, pre_idx - 1)
+            if pre2_idx != pre_idx:
+                dt_pre = pre_idx - pre2_idx
+                m_pre_x = (pre_lm['x'] - result[pre2_idx]['pose']['landmarks'][landmark_key]['x']) / dt_pre
+                m_pre_y = (pre_lm['y'] - result[pre2_idx]['pose']['landmarks'][landmark_key]['y']) / dt_pre
+                m_pre_z = (pre_lm['z'] - result[pre2_idx]['pose']['landmarks'][landmark_key]['z']) / dt_pre
+            else:
+                m_pre_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                m_pre_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                m_pre_z = (post_lm['z'] - pre_lm['z']) / total_gap
+
+            post2_idx = min(len(phase_labels) - 1, post_idx + 1)
+            if post2_idx != post_idx:
+                dt_post = post2_idx - post_idx
+                m_post_x = (result[post2_idx]['pose']['landmarks'][landmark_key]['x'] - post_lm['x']) / dt_post
+                m_post_y = (result[post2_idx]['pose']['landmarks'][landmark_key]['y'] - post_lm['y']) / dt_post
+                m_post_z = (result[post2_idx]['pose']['landmarks'][landmark_key]['z'] - post_lm['z']) / dt_post
+            else:
+                m_post_x = (post_lm['x'] - pre_lm['x']) / total_gap
+                m_post_y = (post_lm['y'] - pre_lm['y']) / total_gap
+                m_post_z = (post_lm['z'] - pre_lm['z']) / total_gap
+
+            for j in range(seg_start, seg_end + 1):
+                t = (j - pre_idx) / total_gap
+                h00 = 1 - 3*t*t + 2*t*t*t
+                h10 = t - 2*t*t + t*t*t
+                h01 = -t*t + 2*t*t*t
+                h11 = -t*t + t*t*t
+                lm = result[j]['pose']['landmarks'][landmark_key]
+                lm['x'] = h00 * pre_lm['x'] + h10 * m_pre_x * total_gap + h01 * post_lm['x'] + h11 * m_post_x * total_gap
+                lm['y'] = h00 * pre_lm['y'] + h10 * m_pre_y * total_gap + h01 * post_lm['y'] + h11 * m_post_y * total_gap
+                lm['z'] = h00 * pre_lm['z'] + h10 * m_pre_z * total_gap + h01 * post_lm['z'] + h11 * m_post_z * total_gap
+                lm['visibility'] = 0.5
+
+        return result
+
+    def _interpolate_underwater_limbs_spline(
+        self, frames: List[Dict], arm: str, phase_labels: List[str]
+    ) -> List[Dict]:
+        """Fallback: pure cubic Hermite spline interpolation for wrist and
+        elbow, without kinematic constraints."""
+        result = self._interpolate_underwater_limbs_single(
+            frames, arm, phase_labels, f'{arm}_wrist')
+        result = self._interpolate_underwater_limbs_single(
+            result, arm, phase_labels, f'{arm}_elbow')
+        return result
+
     def _metric_elbow_min_pull(self, frames: List[Dict], cycles: List[Tuple[int, int]],
                                 near_arm: str) -> Dict:
-        """Minimum elbow angle during the pull phase (2D, near arm).
+        """Minimum elbow angle during the pull (water) phase (2D, near arm).
 
-        Uses per-cycle pull-phase minimum, then median across cycles.
+        Uses air/water phase labels to measure elbow angle only during the
+        underwater pull phase.  When the wrist and elbow are invisible
+        underwater, their positions are interpolated via cubic Hermite spline
+        from visible frames before/after the segment.
         """
         ELBOW_MIN = 30.0
         ELBOW_MAX = 180.0
 
+        phase_info = self._detect_air_water_phases(frames)
+        water_labels = phase_info['near_arm_labels']
+        interpolated_frames = self._interpolate_underwater_limbs(frames, near_arm, water_labels)
+
         if not cycles:
-            # Fallback: overall minimum from near arm
             angles = []
-            for f in frames:
+            for i, f in enumerate(interpolated_frames):
+                if water_labels[i] != 'water':
+                    continue
                 landmarks = f['pose']['landmarks']
                 sh = landmarks[f'{near_arm}_shoulder']
                 el = landmarks[f'{near_arm}_elbow']
                 wr = landmarks[f'{near_arm}_wrist']
                 if (sh['visibility'] >= MIN_VISIBILITY and
-                    el['visibility'] >= MIN_VISIBILITY and
-                    wr['visibility'] >= MIN_VISIBILITY):
+                    el['visibility'] >= MIN_VISIBILITY):
                     a = calculate_angle(sh, el, wr, use_3d=False)
                     if ELBOW_MIN <= a <= ELBOW_MAX:
                         angles.append(a)
@@ -617,15 +1187,16 @@ class BaseAnalyzer(ABC):
             pull_end = min(end - 3, len(frames) - 1)
             angles = []
             for i in range(pull_start, pull_end):
-                if i >= len(frames):
+                if i >= len(interpolated_frames):
                     break
-                landmarks = frames[i]['pose']['landmarks']
+                if water_labels[i] != 'water':
+                    continue
+                landmarks = interpolated_frames[i]['pose']['landmarks']
                 sh = landmarks[f'{near_arm}_shoulder']
                 el = landmarks[f'{near_arm}_elbow']
                 wr = landmarks[f'{near_arm}_wrist']
                 if (sh['visibility'] >= MIN_VISIBILITY and
-                    el['visibility'] >= MIN_VISIBILITY and
-                    wr['visibility'] >= MIN_VISIBILITY):
+                    el['visibility'] >= MIN_VISIBILITY):
                     a = calculate_angle(sh, el, wr, use_3d=False)
                     if ELBOW_MIN <= a <= ELBOW_MAX:
                         angles.append(a)
@@ -639,6 +1210,71 @@ class BaseAnalyzer(ABC):
             'pull_min': np.median(per_cycle),
             'per_cycle': per_cycle,
             'num_cycles': len(per_cycle),
+        }
+
+    def _metric_recovery_elbow(self, frames: List[Dict], cycles: List[Tuple[int, int]],
+                                near_arm: str) -> Dict:
+        """Elbow angle during the recovery (air) phase (2D, near arm).
+
+        Measured only on frames labelled 'air'.
+        """
+        ELBOW_MIN = 30.0
+        ELBOW_MAX = 180.0
+
+        phase_info = self._detect_air_water_phases(frames)
+        air_labels = phase_info['near_arm_labels']
+
+        if not cycles:
+            angles = []
+            for i, f in enumerate(frames):
+                if air_labels[i] != 'air':
+                    continue
+                landmarks = f['pose']['landmarks']
+                sh = landmarks[f'{near_arm}_shoulder']
+                el = landmarks[f'{near_arm}_elbow']
+                wr = landmarks[f'{near_arm}_wrist']
+                if (sh['visibility'] >= MIN_VISIBILITY and
+                    el['visibility'] >= MIN_VISIBILITY and
+                    wr['visibility'] >= MIN_VISIBILITY):
+                    a = calculate_angle(sh, el, wr, use_3d=False)
+                    if ELBOW_MIN <= a <= ELBOW_MAX:
+                        angles.append(a)
+            return {
+                'avg': np.mean(angles) if angles else None,
+                'max': np.max(angles) if angles else None,
+                'num_frames': len(angles),
+            }
+
+        per_cycle_avg = []
+        per_cycle_max = []
+        for start, end in cycles:
+            angles = []
+            for i in range(start, end):
+                if i >= len(frames):
+                    break
+                if air_labels[i] != 'air':
+                    continue
+                landmarks = frames[i]['pose']['landmarks']
+                sh = landmarks[f'{near_arm}_shoulder']
+                el = landmarks[f'{near_arm}_elbow']
+                wr = landmarks[f'{near_arm}_wrist']
+                if (sh['visibility'] >= MIN_VISIBILITY and
+                    el['visibility'] >= MIN_VISIBILITY and
+                    wr['visibility'] >= MIN_VISIBILITY):
+                    a = calculate_angle(sh, el, wr, use_3d=False)
+                    if ELBOW_MIN <= a <= ELBOW_MAX:
+                        angles.append(a)
+            if angles:
+                per_cycle_avg.append(np.mean(angles))
+                per_cycle_max.append(np.max(angles))
+
+        if not per_cycle_avg:
+            return {'avg': None, 'max': None, 'num_frames': 0}
+
+        return {
+            'avg': np.mean(per_cycle_avg),
+            'max': np.max(per_cycle_max),
+            'num_frames': sum(1 for i in range(len(frames)) if air_labels[i] == 'air'),
         }
 
     def _metric_arm_phase(self, frames: List[Dict]) -> Dict:
@@ -737,7 +1373,10 @@ class BaseAnalyzer(ABC):
 
     @staticmethod
     def _metric_hip_line(frames: List[Dict], torso_lengths: List[float]) -> Dict:
-        """Body line via shoulder→hip→knee angle vs horizontal."""
+        """Body line via shoulder→hip→knee angle vs horizontal.
+
+        Applies Hampel outlier rejection to remove tracker confusion.
+        """
         if len(frames) < 5:
             return {'deviation': None, 'hip_drop': None}
         angles = []
@@ -774,6 +1413,13 @@ class BaseAnalyzer(ABC):
             shoulder_y = (ls['y'] + rs['y']) / 2
             hip_y = (lh['y'] + rh['y']) / 2
             hip_rel.append((hip_y - shoulder_y) / tl)
+
+        # Outlier rejection via Hampel filter
+        if angles:
+            filtered = hampel_filter(angles, HAMPEL_WINDOW, HAMPEL_NSIGMA)
+            filtered = [v for v in filtered if v is not None]
+            if len(filtered) >= 3:
+                angles = filtered
 
         return {
             'deviation': np.mean(angles) if angles else None,
@@ -884,7 +1530,14 @@ class BaseAnalyzer(ABC):
                               f'Only {valid_ratio:.1%} valid frames — results may be unreliable',
                               'Improve lighting and camera position')]
 
-        # ── Elbow dropped ──
+        # ── No cycles detected ──
+        num_cycles = metrics.get('num_cycles', 0)
+        if num_cycles == 0 and valid_ratio >= MIN_VALID_FRAME_RATIO:
+            return [BaseIssue('no_cycles_detected', SEVERITY_CRITICAL,
+                              'No stroke cycles detected — swimmer not visible or not swimming during the selected time range',
+                              'Check that the video shows the swimmer from a side view and the time range covers active swimming')]
+
+        # ── Elbow dropped (water phase) ──
         elbow = metrics.get('elbow_min_pull', {})
         if elbow.get('pull_min') is not None:
             pull_min = elbow['pull_min']
@@ -897,6 +1550,16 @@ class BaseAnalyzer(ABC):
                     issues.append(BaseIssue('dropped_elbow', SEVERITY_CRITICAL,
                         f"Dropped elbow (pull min {pull_min:.0f}°, {frac:.0%} cycles > {dropped_thresh:.0f}°)",
                         'Keep elbow bent during pull (~90-120°)', pull_min, frac))
+
+        # ── Elbow during recovery (air phase) ──
+        rec_elbow = metrics.get('recovery_elbow', {})
+        if rec_elbow.get('avg') is not None:
+            avg_rec_elbow = rec_elbow['avg']
+            rec_elbow_max = cfg.thresholds.get('recovery_elbow_max', 160)
+            if avg_rec_elbow > rec_elbow_max:
+                issues.append(BaseIssue('recovery_elbow_too_straight', SEVERITY_MODERATE,
+                    f"Arm too straight during recovery (avg {avg_rec_elbow:.0f}°)",
+                    'Keep elbow slightly bent to skim the water', avg_rec_elbow))
 
         # ── Arm phase ──
         phase = metrics.get('arm_phase', {})
@@ -911,8 +1574,11 @@ class BaseAnalyzer(ABC):
         hip = metrics.get('hip_line', {})
         if hip.get('deviation') is not None:
             dev = hip['deviation']
-            max_dev = cfg.thresholds.get('hip_line_drop_max', 15)
-            if dev > max_dev:
+            # dev = 180° = perfectly straight; dev < 180 - hip_line_drop_max means
+            # the body is bent more than hip_line_drop_max degrees from straight
+            max_straight_dev = cfg.thresholds.get('hip_line_drop_max', 15)
+            threshold = 180 - max_straight_dev
+            if dev < threshold:
                 issues.append(BaseIssue('hips_drop', SEVERITY_CRITICAL,
                     f"Hips drop (body-line deviation {dev:.1f}°)",
                     'Keep hips high — engage core', dev))

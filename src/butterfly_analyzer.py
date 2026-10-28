@@ -10,7 +10,7 @@ Stroke-specific:
 from typing import List, Dict, Tuple
 import numpy as np
 
-from src.base_analyzer import BaseAnalyzer, BaseIssue, MIN_VISIBILITY, PERSISTENCE_THRESHOLD, calculate_angle
+from src.base_analyzer import BaseAnalyzer, BaseIssue, MIN_VISIBILITY, PERSISTENCE_THRESHOLD, calculate_angle, moving_average, hampel_filter
 from src.stroke_config import CONFIGS
 
 
@@ -35,12 +35,17 @@ class ButterflyAnalyzer(BaseAnalyzer):
 
         # Wrist-x signal
         wrist_x = []
+        valid_count = 0
         for f in frames:
             lm = f['pose']['landmarks'][f'{near_arm}_wrist']
-            wrist_x.append(lm['x'] if lm['visibility'] >= MIN_VISIBILITY else None)
+            if lm['visibility'] >= MIN_VISIBILITY:
+                wrist_x.append(lm['x'])
+                valid_count += 1
+            else:
+                wrist_x.append(None)
 
         window = max(3, len(wrist_x) // 30)
-        smoothed = self._moving_average([v if v is not None else 0 for v in wrist_x], window)
+        smoothed = moving_average([v if v is not None else 0 for v in wrist_x], window)
 
         min_gap = max(5, len(frames) // 30)
         peaks = []
@@ -65,7 +70,7 @@ class ButterflyAnalyzer(BaseAnalyzer):
             else:
                 ankle_y.append(None)
 
-        ankle_smoothed = self._moving_average([v if v is not None else 0 for v in ankle_y], window)
+        ankle_smoothed = moving_average([v if v is not None else 0 for v in ankle_y], window)
         ankle_peaks = []
         last = -999
         for i in range(1, len(ankle_smoothed) - 1):
@@ -136,7 +141,13 @@ class ButterflyAnalyzer(BaseAnalyzer):
         if not valid_hip:
             return {'undulation_amplitude': None}
 
-        amp = (np.max(valid_hip) - np.min(valid_hip)) / np.median(valid_hip)
+        # Apply Hampel filter to remove outlier hip-y values
+        filtered_hip = hampel_filter(valid_hip, 5, 3)
+        filtered_hip = [v for v in filtered_hip if v is not None]
+        if len(filtered_hip) < 3:
+            filtered_hip = valid_hip
+
+        amp = (np.max(filtered_hip) - np.min(filtered_hip)) / np.median(filtered_hip)
 
         def _sig(arr):
             valid = [(i, v) for i, v in enumerate(arr) if v is not None]
@@ -161,9 +172,21 @@ class ButterflyAnalyzer(BaseAnalyzer):
             corr = np.corrcoef(hip_d, knee_d)[0, 1]
             phase_lags['hip_knee'] = float(corr) if not np.isnan(corr) else None
 
+        # Detect undulation cycles from hip signal peaks
+        undulation_cycles = 0
+        if hip_sig and len(hip_sig) >= 4:
+            # Count local maxima in the hip signal (each peak = one undulation cycle)
+            # Use a simple peak detection: a point is a peak if it's greater than both neighbors
+            peaks = 0
+            for i in range(1, len(hip_sig) - 1):
+                if hip_sig[i] > hip_sig[i-1] and hip_sig[i] > hip_sig[i+1]:
+                    peaks += 1
+            undulation_cycles = max(0, peaks - 1) if peaks > 1 else 0
+
         return {
             'undulation_amplitude': float(amp),
             'num_hip_cycles': len(valid_hip),
+            'undulation_cycles': undulation_cycles,
             'phase_lags': phase_lags,
         }
 
@@ -185,7 +208,7 @@ class ButterflyAnalyzer(BaseAnalyzer):
 
         window = max(3, len(ankle_y) // 30)
         smoothed = [v if v is not None else 0 for v in ankle_y]
-        smoothed = BaseAnalyzer._moving_average(smoothed, window)
+        smoothed = moving_average(smoothed, window)
 
         min_gap = max(5, len(frames) // 30)
         ankle_peaks = []

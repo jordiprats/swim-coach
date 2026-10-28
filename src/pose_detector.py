@@ -9,8 +9,12 @@ from typing import List, Dict, Optional
 class PoseDetector:
     """Detects and tracks swimmer pose using MediaPipe."""
 
-    def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
-        """Initialize MediaPipe Pose detector."""
+    def __init__(self, min_detection_confidence=0.3, min_tracking_confidence=0.3):
+        """Initialize MediaPipe Pose detector.
+
+        Lower confidence thresholds (0.3 instead of 0.5) to recover more frames
+        when the swimmer is small or partially underwater.
+        """
         self.mp_pose = mp.solutions.pose
         self.pose = self.mp_pose.Pose(
             min_detection_confidence=min_detection_confidence,
@@ -72,8 +76,20 @@ class PoseDetector:
                 'visibility': landmark.visibility
             }
 
+        # ── World landmarks (3D coordinates in metres, consistent space) ──
+        world_landmarks = {}
+        if results.pose_world_landmarks:
+            for name, idx in self.LANDMARKS.items():
+                wlm = results.pose_world_landmarks.landmark[idx]
+                world_landmarks[name] = {
+                    'x': wlm.x,
+                    'y': wlm.y,
+                    'z': wlm.z,
+                }
+
         return {
             'landmarks': landmarks,
+            'world_landmarks': world_landmarks,
             'raw_landmarks': results.pose_landmarks,
             'frame_shape': (h, w)
         }
@@ -99,6 +115,10 @@ class PoseDetector:
 
         print(f"Processing video: {total_frames} frames at {fps:.2f} fps (analyzing every {skip_frames} frames)")
 
+        # ── Temporal consistency tracking ──
+        prev_nose = None  # (x, y, frame_idx) from last accepted frame
+        MAX_DISPLACEMENT_PER_FRAME = 500  # max pixels per frame-gap
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -112,16 +132,32 @@ class PoseDetector:
             pose_result = self.detect_pose(frame)
             processed_count += 1
 
+            # ── Temporal consistency: reject garbage detections ──
+            if pose_result is not None:
+                nose = pose_result['landmarks'].get('nose')
+                if nose and prev_nose is not None:
+                    dx = abs(nose['x'] - prev_nose[0])
+                    dy = abs(nose['y'] - prev_nose[1])
+                    gap = frame_count - prev_nose[2]  # frames since last valid
+                    max_disp = MAX_DISPLACEMENT_PER_FRAME * max(gap, 1)
+                    if dx > max_disp or dy > max_disp:
+                        # Nose jumped too far — likely a false detection
+                        pose_result = None
+                    else:
+                        prev_nose = (nose['x'], nose['y'], frame_count)
+                elif nose:
+                    prev_nose = (nose['x'], nose['y'], frame_count)
+                else:
+                    prev_nose = None
+
             pose_data.append({
                 'frame_number': frame_count,
                 'timestamp': frame_count / fps,
                 'pose': pose_result,
-                # NOTE: frames are NOT stored here to avoid memory exhaustion.
-                # The visualizer re-reads frames directly from the source video.
             })
 
             frame_count += 1
-            if processed_count % 15 == 0:  # Show progress more often
+            if processed_count % 15 == 0:
                 pct = (frame_count / total_frames) * 100
                 print(f"Progress: {pct:.1f}% ({processed_count} frames analyzed)")
 
